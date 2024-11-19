@@ -1,0 +1,130 @@
+---
+title: "TORC1関連因子遺伝子破壊株におけるAde4-GFP foci形成の観察"
+author: "MT"
+date: "2022-05-24"
+output:
+  html_document: 
+    number_section: yes
+    toc: yes
+    toc_float: yes
+    highlight: textmate
+    theme: lumen
+  word_document:
+    toc: yes
+    toc_depth: '3'
+  pdf_document:
+    toc: yes
+    toc_depth: '3'
+  always_allow_html: yes
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r klippy, echo=FALSE, include=TRUE}
+klippy::klippy(position = c('top', 'right'))  ## コードのコピーボタンを作成、PDFやWordでKnitする際はコメントアウトする
+```
+---
+# この事例で扱うデータと統計
+**カテゴリ変数**：遺伝型を表す `strain`  
+**数値変数**： 顆粒を持つ細胞の割合（%）`pct_foci_cell`  
+**グラフ**：棒グラフ（平均） + エラーバー（1SD） + ドットプロット（各データポイント）  
+**統計**：無し
+
+# データの取得と読み込み
+既知のTORC1の上流および下流因子の遺伝子破壊株におけるAde4-yeGFP顆粒形成効率を測定する。細胞をアデニン無しの培地に移してAde4-GFP fociを形成させて蛍光顕微鏡観察。画像処理により顆粒を持つ細胞の割合を計測し、結果をExcelファイルにまとめた。
+
+```{r}
+library(pacman) # パッケージをまとめてロード
+p_load(tidyverse, openxlsx, readxl, ggtext, multcomp, ggsignif, knitr, nparcomp, rstatix, dunn.test)
+```
+
+```{r}
+mutant_foci <- read_excel("concat_201112.xlsx", 
+                          col_types = c("skip", "skip", "skip", 
+                                        "skip", "skip", "text", "skip", "text", 
+                                        "numeric"))
+mutant_foci <- mutant_foci %>% 
+  filter(cr_pct_foci_cell !="") ## NAのデータを除く
+mutant_class <- read_excel("torc1_mut_classification.xlsx")  ## TORC1との関係性のデータ
+```
+
+***
+# データの集計
+視野内で顆粒を持つ細胞の割合（%）を表す変数`cr_pct_foci_cell`の平均とSDを求める。また1ｘSDに相当するerror barを書くための範囲を設定。結果をExcelファイルとして保存。
+```{r}
+mean_sd <- mutant_foci %>% 
+  group_by(strain) %>% 
+  summarise(meanfoci = mean(cr_pct_foci_cell), sdfoci = sd(cr_pct_foci_cell))
+# mean_sd <- arrange(mean_sd, meanfoci) # データをソート
+```
+
+TORC1との関連性を表す変数`signaling`を`left_join`で導入する。
+```{r}
+mean_sd <- mean_sd %>%
+  left_join(mutant_class, by = "strain")
+mutant_foci <- mutant_foci %>% 
+  left_join(mutant_class, by = "strain")
+write.xlsx(mean_sd, "220524_torc1mut_mean_sd.xlsx", colNames = TRUE, sheetName = "220524_torc1mut")
+```
+
+無関係なreg1∆のデータを取り除く。またwtのデータを抽出しておく。
+```{r}
+mean_sd <- mean_sd %>% 
+  filter(strain !="reg1") # reg1のデータを除く
+mutant_foci <- mutant_foci %>% 
+  filter(strain !="reg1") # reg1のデータを除く
+mean_wt <- mean_sd %>%  
+  filter(strain == "wt") # wtのデータを抽出しておく
+```
+
+***
+# データの可視化
+顆粒を持つ細胞の割合の平均値を棒グラフで、1SDをエラーバーで描画。個々のデータ点もプロット。プロットの縦軸と横軸を入れ替える。
+```{r}
+plot1 <- ggplot(mean_sd, aes (x = reorder(x =strain, -meanfoci), y = meanfoci)) + # strainを -meanfociで並べ変える、すなわち逆順
+  geom_bar(aes(fill = signaling), stat = "identity")+  # TORC1との関係性に応じてバーの色を変える
+  # geom_errorbarで標準偏差を描く
+  geom_errorbar(mapping = aes(ymin = meanfoci - sdfoci, ymax = meanfoci + sdfoci, width = 0.2)) + 
+  geom_jitter(mutant_foci, mapping = aes (x= reorder(x = strain, X = -cr_pct_foci_cell, FUN = mean), y = cr_pct_foci_cell), size =2,
+              color = 'black', alpha =0.6, height = 0, width = 0.1)+ # jitterで適当に点を散らす
+  geom_hline(yintercept = mean_wt$meanfoci, linetype = 2, alpha=0.5)+  # wtの平均値を点線で表す
+  # 凡例の表示順を変えて、fillの色も変える
+  scale_fill_brewer(palette = "Set2",limits = c("upstream","downstream","others","wild-type")) + 
+  ylab("% cells with Ade4-GFP foci") +
+  xlab("Strain")+
+  ylim(0 ,100) + # % cells with fociの値の範囲を設定
+  theme_bw() +
+  coord_flip()　# 軸を入れ替える
+plot1
+```
+
+***  
+（別法）`mean_sd`の行を`meanfoci`の小さい順に並べ替える。次に`strain`を`as_factor()`でfactor型に変換、この時レベル順も`strain`の並び順と同一になる。factor型にしてから並び替えると上手くいかないので注意。`geom_jitter()`のx軸の並べ替えの指定が不要になる。
+```{r}
+mean_sd$strain  # 最初はstrainは文字型
+levels(mean_sd$strain)
+
+mean_sd <- mean_sd %>% 
+  arrange(desc(meanfoci))
+mean_sd$strain <- as_factor(mean_sd$strain)
+
+plot2 <- mean_sd %>%
+  ggplot(aes(x =strain, y = meanfoci)) + 
+  geom_bar(aes(fill = signaling), stat = "identity")+  # TORC1との関係性に応じてバーの色を変える
+  # geom_errorbarで標準偏差を描く
+  geom_errorbar(mapping = aes(ymin = meanfoci - sdfoci, ymax = meanfoci + sdfoci, width = 0.2)) +
+    geom_jitter(mutant_foci, mapping = aes(x = strain, y = cr_pct_foci_cell), size =2,
+              color = 'black', alpha =0.6, height = 0, width = 0.1) +
+  geom_hline(yintercept = mean_wt$meanfoci, linetype = 2, alpha=0.5) +
+  # 凡例の表示順を変えて、fillの色も変える
+  # scale_fill_brewer(palette = "Set2",limits = c("upstream","downstream","others","wild-type")) +
+  ylab("% cells with Ade4-GFP foci") +
+  xlab("Strain") +
+  ylim(0 ,100) + 
+  theme_bw() +
+  coord_flip()
+plot2
+```
+

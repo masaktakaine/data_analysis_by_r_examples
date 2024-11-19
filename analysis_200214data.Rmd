@@ -1,0 +1,138 @@
+---
+title: "蛍光タンパク質によるAde4凝集体の様相の違い"
+author: "MT"
+date: "2020-02-12"
+output:
+  html_document: 
+    number_section: yes
+    toc: yes
+    toc_float: yes
+    highlight: textmate
+    theme: lumen
+  word_document:
+    toc: yes
+    toc_depth: '3'
+  pdf_document:
+    toc: yes
+    toc_depth: '3'
+  always_allow_html: yes
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r klippy, echo=FALSE, include=TRUE}
+klippy::klippy(position = c('top', 'right'))  ## コードのコピーボタンを作成、PDFやWordでKnitする際はコメントアウトする
+```
+---
+# この事例で扱うデータと統計
+**カテゴリ変数**：Ade4に融合させた蛍光タンパク質 `Construct` (GFP, mGFP, mNG)   
+**数値変数**： Ade4粒子の蛍光強度 `Mean_intensity`  
+**グラフ**：ボックスプロット + 平均値 + ドットプロット（各データポイント）  
+**統計**：Shapiro-Wilk検定によるデータの正規性の検証、Kruskal-Wallis検定によるノンパラメトリックな1元配置分散分析、Steel-Dwassの多重検定（ノンパラメトリック）
+
+# データの取得と読み込み
+Ade4のC末端側に融合させた蛍光タンパク質の種類による、細胞内Ade4凝集体の蛍光強度の違いを検証。細胞をアデニン無しの培地に移して凝集体を形成させ、蛍光顕微鏡観察。各種凝集体の蛍光強度を計測し、csvファイルで出力。
+
+```{r}
+library(pacman) # パッケージをまとめてロード
+p_load(tidyverse, openxlsx, readxl, ggtext, multcomp, ggsignif, knitr, nparcomp, rstatix, dunn.test)
+```
+
+***
+計測したデータをまとめたExcelファイルを指定して読み込む。
+```{r}
+X200212_ade4_mean_intensity <- read_excel("~/Dropbox/200212_Ade4FPtag_analysis/200212_ade4_mean_intensity.xlsx", 
+                                          sheet = "for R")
+```
+
+データがワイド形式なのでロング形式に変換。値の入っていない行を除く。
+```{r}
+construct_intensity <- X200212_ade4_mean_intensity %>% 
+  gather(Construct, Mean_intensity, 1:3)
+
+# NAのデータを除く
+construct_intensity <- filter(construct_intensity, Mean_intensity !="") 
+```
+
+変数Constructをファクター型に変換。値`mGFP`を基準のレベルに設定。
+```{r}
+# Constructをcharacterからfactorに変換
+construct_intensity$Construct <- factor(construct_intensity$Construct)  
+levels(construct_intensity$Construct)
+# myeGFPをbase levelにする
+construct_intensity$Construct <- relevel(construct_intensity$Construct, ref = "mGFP") 
+levels(construct_intensity$Construct) # 確認
+```
+
+***
+# 正規性の検証
+Shapiro-Wilk検定でデータの正規性を確認。ある`Construct`の値に対応する`Mean_intensity`の値の分布を`shapiro_test()`で検定するための関数`swt`を作成。
+```{r}
+# Constructの種類をベクトルとして取り出しておく
+consts <- levels(construct_intensity$Construct)
+
+swt <- function(const) {construct_intensity %>%  
+    filter(Construct == const) %>% 
+    dplyr::select(Mean_intensity) %>%  
+    as_vector() %>% 
+    shapiro_test()}
+```
+
+`lapply()`で`consts`の各要素を自作関数`swt`に入力して、計算結果をリストにまとめて出力。`sink()`で出力結果をテキストファイルに保存。
+```{r}
+swt_result <- lapply(consts, swt)
+names(swt_result) <- consts  # リストの要素の名前をつける
+
+sink("result_shapiro_test.txt")
+swt_result
+sink()
+```
+`mNG`のp値が<0.05であり、正規性があるとは言い切れない。従って以後はノンパラメトリックな手法で解析。
+
+***
+ノンパラメトリックな分散分析にはKruskal-Wallis検定を使用する。p<0.05より`Construct`間に違いがあることが示唆された。
+```{r}
+aov_kw <- construct_intensity %>%  kruskal_test(Mean_intensity ~ Construct)
+aov_kw
+```
+`mGFP`のデータを他2つと比較したいので、パラメトリックな多重検定ではDunnett testに相当する。Dunnett法のノンパラメトリック版としてSteel testで多重比較する。`nparcomp`パッケージの`nparcomp()`を使用。
+```{r}
+res_steel <- nparcomp(Mean_intensity ~ Construct, data = construct_intensity,
+              asy.method = "mult.t", rounds = 3,
+              type = "Dunnett", control = "mGFP", # Dunnettの場合はcontrolでbase levelを指定
+              alternative = "two.sided", info = FALSE)
+sink("res_steel_test.txt")
+summary(res_steel)
+sink()
+```
+いずれの組み合わせでも、p値は極めて小さく、有意な差があることが示唆された。
+
+***
+# データの可視化
+横軸を`Construct`、縦軸を`Mean_intensity`としてボックスプロット、各データポイントもプロット。×で平均値を示す。検定の結果も表示。
+```{r}
+plot1 <- ggplot(construct_intensity, aes (x = Construct, y =Mean_intensity)) + 
+  geom_boxplot(aes(fill = Construct)) +
+  # 平均値の描画
+  stat_summary(fun = mean, geom = "point", color = "black", shape = 4, size = 4) + 
+  # jitterで適当に点を散らす
+  geom_jitter(size =1.5, color = 'black', alpha =0.75, height = 0, width = 0.1) + 
+   # 比較の組とアノテーションを直接指定して描画できる 
+  geom_signif(comparisons = list(c("GFP", "mGFP")), tip_length = 0.01, annotations = c("<1e-7")) +
+  geom_signif(comparisons = list(c("mNG", "mGFP")), tip_length = 0.01, annotations = c("<1e-7"), y_position = 2500) +
+  # x軸の並びを逆にする
+  scale_x_discrete(limits=c("GFP", "mGFP", "mNG")) +
+  # 手動でfillの色を指定
+  scale_fill_manual(values = c('#3182bd','#bdbdbd',"#e6550d")) +
+  xlab("") + # x軸ラベルに何も表示しない
+  ylab("Mean intensity (A.U)") + # y軸ラベルの設定
+  theme(axis.title.y = element_text(size=12), axis.text.y = element_text(size=12,color = "black"),
+        axis.title.x = element_text(size=12), axis.text.x = element_text(size=12,color = "black")
+        ,legend.position = "none" #凡例を消す
+        ,panel.border = element_rect(fill = NA, linewidth = 0.5) # パネルを枠で囲む
+        ,panel.background = element_blank()) # 背景を白にする
+plot1
+```
+

@@ -1,0 +1,278 @@
+---
+title: "ラパマイシン処理した細胞の細胞内蛍光輝度の解析"
+author: "MT"
+date: "2023-05-02"
+output:
+  html_document: 
+    number_section: yes
+    toc: yes
+    toc_float: yes
+    highlight: textmate
+    theme: lumen
+  word_document:
+    toc: yes
+    toc_depth: '3'
+  pdf_document:
+    toc: yes
+    toc_depth: '3'
+  always_allow_html: yes
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+```{r klippy, echo=FALSE, include=TRUE}
+klippy::klippy(position = c('top', 'right'))  ## コードのコピーボタンを作成、PDFやWordでKnitする際はコメントアウトする
+```
+---
+# この事例で扱うデータと統計
+**カテゴリ変数**：細胞の処理条件 `condition`（DMSO, Rapamycin）、細胞内顆粒の有無 `withfoci`（granules, no granules）  
+**数値変数**： 細胞内総輝度 `cell_intden`  
+**グラフ**：棒グラフ（平均） + エラーバー（1SD） + ドットプロット   
+**統計**：Shapiro-Wilk検定によるデータの正規性の検証、Mann-Whitney U-test（ノンパラメトリック）
+
+# データの読み込み
+ラパマイシン処理によって細胞内Ade4-mNG顆粒を持つ細胞の割合は減少する。この時ラパマイシンによりTORC1活性が阻害され、タンパク質翻訳が低下することで、Ade4-mNGのタンパク質量が減少したため、顆粒が形成されなかった可能性も考えられた。そこで既存のデータから細胞内のAde4-mNGの総蛍光強度`cell_intden`を改めて測定し、ラパマイシン処理によって変化するかどうか検証する。
+
+```{r}
+library(pacman) # パッケージをまとめてロード
+p_load(tidyverse, openxlsx, readxl, ggtext, multcomp, ggsignif, knitr, nparcomp)
+```
+
+各細胞内の総蛍光輝度を測定できるよう修正した画像処理スクリプトで再解析。一応、顆粒を持つ細胞の割合も再計算したが、値はほとんど変わらなかった。
+フォルダ`prom750R`にcsvファイルをまとめた。読み込んで`bind_rows()`でまとめる。
+```{r}
+import_file_path_prom750 <- "prom750R" 
+list_prom750_cell_data <- list.files("prom750R_foci_data", full.names = T, pattern = "*.csv") 
+cell_dat <- list_prom750_cell_data %>%
+  sapply(., read.csv, header =T, sep = ",", stringsAsFactors = F, simplify = F) %>%
+  bind_rows() 
+```
+顆粒の有無を表す変数`withfoci`の値はTrue/Falseなので、わかりやすい値に変換。また処理条件を示す変数`condition`と実験日を表す変数`expday`を追加。
+```{r}
+# withfoiの表記を変更
+cell_dat <- cell_dat %>% 
+  mutate(withfoci = if_else(withfoci, "granules", "no granules"))
+
+#処理条件を表す列conditionを作成する
+cell_dat <-       
+  cell_dat %>% 　　　　　　　　　　
+  mutate(condition =case_when(　　　　　　　　
+    str_detect(image_file, "dmso") ~ "DMSO",         
+    str_detect(image_file, "rapa") ~ "Rapamycin"))
+
+# 実験日を表す列expdayを作成
+cell_dat <- cell_dat %>% 
+  mutate(expday = if_else(str_detect(date, "27R"), "exp1", "exp2"))
+```
+この時点では`condition`が文字列型なのでfactor型に変換しておく、文字列型のママだと多重検定でエラーになる。また`fct_relevel`でレベル順を変更。
+```{r}
+cell_dat$condition <- as_factor(cell_dat$condition)
+cell_dat$condition <- fct_relevel(cell_dat$condition, c("DMSO", "Rapamycin"))
+```
+細胞を一意に同定する変数`cellid`を追加。ファイル名とcell numberを組み合わせる。必要な変数だけを抽出。
+```{r}
+cell_dat <- cell_dat %>% 
+  mutate(cellid = str_c(image_file, cell_number, sep = "_")) %>%
+  # 必要な変数だけを残す
+  dplyr::select(expday, cellid, image_file, condition, withfoci, cell_intden) %>% 
+  # tibble形式にしておく
+  as_tibble()
+cell_dat
+```
+顆粒を持つ細胞のデータは重複しているので、`dinstinct()`で1つにする。
+```{r}
+cell_dat_uni <- cell_dat %>% 
+  distinct(cellid, .keep_all = TRUE) 
+cell_dat_uni
+```
+
+# データの解析
+## 視野毎に平均化しない場合  
+`group_nest()`を使用して各条件でグループ分けして、データを畳み込む。各条件における平均とSD、サンプルサイズを計算。
+```{r}
+cell_dat_uni_nest <- cell_dat_uni %>% 
+  group_nest(expday, condition, withfoci) %>% 
+  mutate(mean = map_dbl(data, ~ mean(.$cell_intden)),
+         sd = map_dbl(data, ~ sd(.$cell_intden)),
+         N = map_int(data, ~ nrow(.)))
+```
+Shapiro-Wilkテストでデータの正規性を検証。各サブデータに対して関数`shapiro.test()`を適用した結果を、新たな列`swtest`に格納。さらにp値を取り出す。いずれの条件でもp値が低く、正規性があるとは言えないため、ノンパラメトリックに解析。
+```{r}
+cell_dat_uni_nest <- cell_dat_uni_nest %>% 
+  # 返り値がリストなのでmapを使用
+  mutate(swtest = map(data, ~ shapiro.test(.$cell_intden)), 
+         sw_pval = map_dbl(swtest, ~.$p.value))
+cell_dat_uni_nest
+```
+`condition`の値、DMSOとRapamycinでMann-Whitney testを使用して比較。`condition`でグループ分けせずに畳み込んだデータを改めて用意。各サブデータに対して関数`wilcox.test()`を適用した結果を、新たな列`mwtest`に格納。さらにp値を取り出す。
+```{r}
+cell_dat_uni_nest2 <- cell_dat_uni %>% 
+  group_nest(expday, withfoci) %>% 
+  mutate(mwtest = map(data, ~ wilcox.test(.$cell_intden ~ .$condition, data =., alternative = "two.sided", paired = FALSE)),
+         mw_pval = map_dbl(mwtest, ~ .$p.value))
+cell_dat_uni_nest2
+```
+結果をExcelファイルに保存するには`write.xlsx()`を使用。畳み込んだデータ列を削除しないとエラーになる。
+```{r}
+cell_dat_uni_nest %>% 
+  dplyr::select(-data, -swtest) %>% 
+  write.xlsx(., "nest_mean_sd.xlsx", colNames = TRUE, sheetName = "221027-28")
+cell_dat_uni_nest2 %>% 
+  dplyr::select(-data, -mwtest) %>% 
+  write.xlsx(., "nest2_mean_sd.xlsx", colNames = TRUE, sheetName = "221027-28")
+```
+
+## データのプロット
+まず実験日毎に別々にプロット。MW testのp値をマニュアルで描く。`facet_grid`でexp1とexp2を並べてプロットすることもできるが、p値がマニュアルで描けない。個々のデータ点が多すぎるのでプロットせずに、棒グラフとエラーバーだけ表示。  
+exp1のプロット：  
+```{r}
+annot1 = c("1.3e-04", "4.6e-18")
+y_position1 = c(6800, 4200)
+xmin1 = c(0.85, 1.85)
+xmax1 = c(1.15, 2.15)
+
+plot_exp1 <- cell_dat_uni_nest %>%
+  filter(expday == "exp1") %>% 
+  ggplot(aes(x= withfoci, y=mean, fill = condition))+
+  geom_bar(aes(fill=condition), stat="identity",
+           color="black",width = 0.6, position = position_dodge(width = 0.6)) + 
+  # step_increaseは組み合わせのバーをどれだけずらすかの値
+  geom_signif(xmin = xmin1, xmax  =xmax1, y_position =y_position1, annotations = annot1, tip_length = 0.01)+
+  geom_errorbar(aes(ymax = mean + sd, ymin = mean - sd), width = 0.2, position = position_dodge(width = 0.6), size = 0.5) +
+  # geom_jitter(unnest(cell_dat_uni_nest, cols = data), mapping=aes(x=withfoci, y= cell_intden), size = 1,
+  #             alpha=0.8, position = position_jitterdodge(jitter.width = 0.1, jitter.height = 0, dodge.width = .6))+
+  ylab("Integrated Density of the cell") +   ## y軸のラベル
+  xlab("")+                   ## x軸のラベル
+  theme( axis.title.y = element_text(size=12), axis.text.y = element_text(size=12,color = "black"),
+         axis.title.x = element_text(size=12), axis.text.x = element_text(size=12,color = "black")
+         # ,legend.position = "none" #凡例を消す
+         ,panel.border = element_rect(fill = NA, linewidth  = 0.5)# パネルを枠で囲む
+         ,panel.background = element_blank()) #背景を白にする
+ # facet_grid(~ expday)
+plot_exp1
+```
+
+exp2のプロット：  
+```{r}
+annot2 = c("9.1e-02", "2.1e-12")
+y_position2 = c(7000, 4200)
+xmin2 = c(0.85, 1.85)
+xmax2 = c(1.15, 2.15)
+
+plot_exp2 <- cell_dat_uni_nest %>%
+  filter(expday == "exp2") %>% 
+  ggplot(aes(x= withfoci, y=mean, fill = condition))+
+  geom_bar(aes(fill=condition), stat="identity",
+           color="black",width = 0.6, position = position_dodge(width = 0.6)) + 
+  geom_signif(xmin = xmin2, xmax  =xmax2, y_position =y_position2, annotations = annot2, tip_length = 0.01)+
+  geom_errorbar(aes(ymax = mean + sd, ymin = mean - sd), width = 0.2, position = position_dodge(width = 0.6), size = 0.5) +
+  # geom_jitter(unnest(cell_dat_uni, cols = data), mapping=aes(x=withfoci, y= cell_intden),size = 1,
+  #             alpha=0.8, position = position_jitterdodge(jitter.width = 0.1, jitter.height = 0, dodge.width = .6))+
+  ylab("Integrated Density of the cell") +   ## y軸のラベル
+  xlab("")+                   ## x軸のラベル
+  theme( axis.title.y = element_text(size=12), axis.text.y = element_text(size=12,color = "black"),
+         axis.title.x = element_text(size=12), axis.text.x = element_text(size=12,color = "black")
+         # ,legend.position = "none" #凡例を消す
+         ,panel.border = element_rect(fill = NA, linewidth  = 0.5)# パネルを枠で囲む
+         ,panel.background = element_blank())#背景を白にする
+plot_exp2
+```
+
+## 実験日を区別しない場合  
+実験日とconditionを区別せずにデータを畳み込んでから、MW testを計算。`unnest()`してから再度`group_nest()`して平均とSDを計算
+```{r}
+cell_dat_uni_nest3 <- 
+  cell_dat_uni %>% 
+  group_nest(withfoci) %>%
+  mutate(mwtest = map(data, ~ wilcox.test(.$cell_intden ~ .$condition, data =., alternative = "two.sided", paired = FALSE)),
+        mw_pval = map_dbl(mwtest, ~ .$p.value)) %>% 
+  dplyr::select(-mwtest) %>% 
+  unnest(cols = c(data)) %>%
+  # mw_pvalでグループ分けすると、畳み込まれない
+  group_nest(withfoci, condition, mw_pval) %>% 
+  mutate(mean = map_dbl(data, ~ mean(.$cell_intden)),
+         sd = map_dbl(data, ~ sd(.$cell_intden)),
+         N = map_int(data, ~ nrow(.)))
+cell_dat_uni_nest3
+```
+同様にプロット。
+```{r}
+annot3 = c("1.5e-04", "8.1e-13")
+y_position3 = c(7000, 4200)
+xmin3 = c(0.85, 1.85)
+xmax3 = c(1.15, 2.15)
+
+plot3 <- cell_dat_uni_nest3 %>%
+  ggplot(aes(x= withfoci, y=mean, fill = condition))+
+  geom_bar(aes(fill=condition), stat="identity",
+           color="black",width = 0.6, position = position_dodge(width = 0.6)) + 
+  # step_increaseは組み合わせのバーをどれだけずらすかの値
+  geom_signif(xmin = xmin3, xmax  =xmax3, y_position =y_position3, annotations = annot3, tip_length = 0.01)+
+  geom_errorbar(aes(ymax = mean + sd, ymin = mean - sd), width = 0.2, position = position_dodge(width = 0.6), size = 0.5) +
+  # geom_jitter(unnest(cell_dat_uni, cols = data), mapping=aes(x=withfoci, y= cell_intden),size = 1,
+  #             alpha=0.8, position = position_jitterdodge(jitter.width = 0.1, jitter.height = 0, dodge.width = .6))+
+  ylab("Integrated Density of the cell") +   ## y軸のラベル
+  xlab("")+                   ## x軸のラベル
+  theme( axis.title.y = element_text(size=12), axis.text.y = element_text(size=12,color = "black"),
+         axis.title.x = element_text(size=12), axis.text.x = element_text(size=12,color = "black")
+         # ,legend.position = "none" #凡例を消す
+         ,panel.border = element_rect(fill = NA, linewidth  = 0.5)# パネルを枠で囲む
+         ,panel.background = element_blank())#背景を白にする
+plot3
+```
+
+## 視野毎にデータを平均化
+各視野における細胞内総輝度を平均化してから解析。`image_file`毎に`cell_intden`の平均値を求める。その後はデータを畳み込んで、同様にMW testを適用し、平均とSDを計算。
+```{r}
+cell_dat_uni_pfv <- cell_dat_uni %>% 
+  group_by(image_file, condition, withfoci) %>% 
+  summarise(cell_intden_pfv = mean(cell_intden))
+cell_dat_uni_pfv
+
+cell_dat_uni_pfv_nest <- cell_dat_uni_pfv %>% 
+  # いったんungroup()しないとエラー
+  ungroup() %>% 
+  group_nest(withfoci) %>% 
+  mutate(mwtest = map(data, ~ wilcox.test(.$cell_intden_pfv ~ .$condition, data =., alternative = "two.sided", paired = FALSE)),
+         mw_pval = map_dbl(mwtest, ~ .$p.value)) %>% 
+  dplyr::select(-mwtest) %>% 
+  unnest(cols = c(data)) %>%
+  # mw_pvalでグループ分けすると、畳み込まれない
+  group_nest(withfoci, condition, mw_pval) %>% 
+  mutate(mean = map_dbl(data, ~ mean(.$cell_intden_pfv)),
+         sd = map_dbl(data, ~ sd(.$cell_intden_pfv)),
+         N = map_int(data, ~ nrow(.)))
+cell_dat_uni_pfv_nest
+```
+結果をExcelファイルに保存。
+```{r}
+cell_dat_uni_pfv_nest %>% 
+  dplyr::select(-data) %>% 
+  write.xlsx(., "nest_pfv_mean_sd.xlsx", colNames = TRUE, sheetName = "221027-28")
+```
+結果をプロット。データポイントが少ないので各点をプロット。また実験日を区別しない。
+```{r}
+annot4 = c("0.17", "8.7e-07")
+y_position4 = c(5500, 3500)
+xmin4 = c(0.85, 1.85)
+xmax4 = c(1.15, 2.15)
+
+plot_pfv <- cell_dat_uni_pfv_nest %>%
+  ggplot(aes(x= withfoci, y=mean, fill = condition))+
+  geom_bar(aes(fill=condition), stat="identity",
+           color="black",width = 0.6, position = position_dodge(width = 0.6)) + 
+  geom_signif(xmin = xmin4, xmax  =xmax4, y_position =y_position4, annotations = annot4, tip_length = 0.01)+
+  geom_errorbar(aes(ymax = mean + sd, ymin = mean - sd), width = 0.2, position = position_dodge(width = 0.6), size = 0.5) +
+  geom_jitter(unnest(cell_dat_uni_pfv_nest, cols = data), mapping=aes(x=withfoci, y= cell_intden_pfv),size = 1,
+              alpha=0.8, position = position_jitterdodge(jitter.width = 0.1, jitter.height = 0, dodge.width = .6))+
+  ylab("Integrated Density of the cell/image") +   ## y軸のラベル
+  xlab("")+                   ## x軸のラベル
+  theme( axis.title.y = element_text(size=12), axis.text.y = element_text(size=12,color = "black"),
+         axis.title.x = element_text(size=12), axis.text.x = element_text(size=12,color = "black")
+         # ,legend.position = "none" #凡例を消す
+         ,panel.border = element_rect(fill = NA, linewidth  = 0.5)# パネルを枠で囲む
+         ,panel.background = element_blank())#背景を白にする
+plot_pfv
+```
+

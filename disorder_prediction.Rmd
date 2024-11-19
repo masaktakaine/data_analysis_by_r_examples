@@ -1,0 +1,109 @@
+---
+title: "各種生物におけるPPATの天然変性領域の解析"
+author: "MT"
+date: "2023-04-01"
+output:
+  html_document:
+    df_print: paged
+    number_section: yes
+    toc: yes
+    toc_float: yes
+    toc_depth: 3
+  word_document:
+    toc: yes
+    toc_depth: '3'
+  pdf_document:
+    toc: yes
+    toc_depth: '3'
+  always_allow_html: yes
+---
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r klippy, echo=FALSE}
+klippy::klippy(position = c('top', 'right'))  ## コードのコピーボタンを作成、PDFやWordでKnitする際はコメントアウトする
+```
+
+# 天然変性領域の予測
+あるタンパク質において、特定の構造をとらない領域は天然変性領域（intrinsically disordered region, IDR）と言われる。IDRは多様な構造をとるために、多様な標的因子と相互作用する。これまでに多くのタンパク質のIDRが液液相分離に関与することが報告されている{Yang, 2019 #9790} {Kato, 2019 #9791} {Franzmann, 2018 #9570} {Zhang, 2015 #10006}（出芽酵母のタンパク質ではSup35, Pbp1, Rnq1, Lsm4、AshbyaのWhi3, Bni1, Cln3）
+
+これまでに様々なIDR予測のアルゴリズムが開発されている：
+
+* **IUPred2A**： 物理化学的性質に基づく予測、結果が出るのが速い{Meszaros, 2018 #10007}
+* **CIDER**： チャージと疎水性からIDRを予測, localCIDERをインストールする必要あり
+* **DISOPRED3**： 結晶構造、NMR、生物物理化学のデータから機械学習、最もアウトプットに時間がかかる
+	2015年の論文で2019年6月で165回の引用{Jones, 2015 #10005}
+
+本プロジェクトでは、DISOPRED3アルゴリズムを利用してタンパク質のアミノ酸配列からの天然変性領域を予測した。DISOPRED3はタンパク質構造を予測するサイト[PSIPRED](http://bioinf.cs.ucl.ac.uk/psipred/psiform.html)から利用可能。アミノ酸配列を入力してしばらく待つと、予測結果が返ってくる。このサイトを利用して様々な生物種におけるPPATの天然変性領域を予測し、結果をExcelファイルにまとめた。
+
+***
+# データの読み込みと変換
+```{r message=FALSE, warning=FALSE}
+library(pacman) # パッケージを一括でロード
+p_load(tidyverse, gplots, readxl, heatmap3)
+```
+
+```{r message=FALSE, warning=FALSE}
+# 生物種に全体のPPATのデータを含むexcel file
+whole_species_disorder <- read_excel("whole_species_disorder.xlsx")
+group_color <- read_excel("group_color.xlsx")  ## groupとcolorの対応表
+head(whole_species_disorder)
+```
+
+***
+*name*は種名、*abbrev*はその略語、*abbrev_group*はグループ名付きの略語、*accession_number*はタンパク質のID、*group*は生物種のグループ。*group*以降の列名の数字はアミノ酸配列の残基数を表し、セル中の値は**Disorder score**を表す。後々、*group*を色で区別するために変数*g_color*を追加、関数`left_join()`を利用
+```{r}
+whole_species_disorder <- whole_species_disorder %>%
+  left_join(group_color, by="group") %>% 
+  # わかりやすいようg_colorを先頭にする
+  dplyr::select(g_color, everything())  
+```
+
+***
+# ヒートマップの作成  
+`heatmap3`パッケージの`heatmap3()`を使用する。入力データの形式は行列型にする必要がある。
+```{r}
+# グループ名付きの種の名前を行列型でshort_nameに代入しておく
+short_name <- as.matrix(dplyr::select(whole_species_disorder, abbrev_group))
+# g_colorを取り出しておく 
+rsc <- whole_species_disorder$g_color
+## disorder score以外を取り除いたデータを行列型でdisorderに代入
+disorder<- whole_species_disorder %>%
+  dplyr::select(-(1:6)) %>% data.matrix()  # as.matrix()とは異なり、値を数値型に保つ
+## disorderの行のラベルをshort_nameにする
+rownames(disorder) <- short_name
+```
+
+ヒートマップの描画。デフォルトでは行も列も自動的にクラスタリングされる。`Colv = NA`は列をクラスタリングしない。
+```{r}
+plot.new()
+heatmap3(disorder, Colv = NA, scale = "none", cexRow = 0.25, # cexRowは行のラベル文字の大きさ
+  # defaultではscale = "row"であり、行方向で正規化（標準化）した値が使われる
+  # 絶対値を使用して色をマッピングする場合は"none"に指定
+           col=colorRampPalette(c("royalblue", "grey90", "orangered"))(100),
+          RowSideColors = rsc, labCol = FALSE, RowSideLabs = FALSE)
+```
+
+***
+関数`legend()`を使用して、別途legendを作成。
+```{r}
+plot.new()
+legend("bottom",      
+       legend = group_color$group,
+       col = group_color$g_color,
+       pch = 15,           
+       cex=0.75,
+       # horiz = T,  # 水平に並べたい場合
+       ncol = 7) # ncolで列数を指定できる
+```
+
+***
+参考：`heatmap.2()`によるヒートマップの作成  
+関数の文法やクラスタリングのアルゴリズムが`heatmap3()`とは異なる。論文ではこちらを使用。`figure margins too large`というエラーが出るため使いにくい。
+```{r echo=TRUE, eval = FALSE}
+plot.new()
+heatmap.2(disorder, key=TRUE, density.info="none", labCol = FALSE, Colv = NA, cexRow = 0.5,
+          trace="none", dendrogram = "row", col = colorRampPalette(c("royalblue","grey90","orangered"))(100),
+          key.title = NA, keysize = 0.5, margins = c(1,10), RowSideColors = rsc)
+```

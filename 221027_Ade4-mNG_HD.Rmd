@@ -1,0 +1,338 @@
+---
+title: "Ade4顆粒形成における1,6-hexanediolの作用の検証"
+author: "MT"
+date: "2022-10-27"
+output:
+  html_document: 
+    number_section: yes
+    toc: yes
+    toc_float: yes
+    highlight: textmate
+    theme: lumen
+  word_document:
+    toc: yes
+    toc_depth: '3'
+  pdf_document:
+    toc: yes
+    toc_depth: '3'
+  always_allow_html: yes
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r klippy, echo=FALSE, include=TRUE}
+klippy::klippy(position = c('top', 'right'))  ## コードのコピーボタンを作成、PDFやWordでKnitする際はコメントアウトする
+```
+---
+# この事例で扱うデータと統計
+**カテゴリ変数**：細胞の処理条件 `condition`（untreated, digitonin, 1,6-HD）  
+**数値変数**： 顆粒を持つ細胞の割合（%）`pct_foci_cell`  
+**グラフ**：棒グラフ（平均） + エラーバー（1SD） + ドットプロット（各データポイント）  
+**統計**：Tukey-Kramerの多重検定（パラメトリック、Shapiro-Wilk検定によるデータの正規性の検証、Kruskal-Wallis検定によるノンパラメトリックな1元配置分散分析、Steel-Dwassの多重検定（ノンパラメトリック）
+
+# データの取得と読み込み
+細胞内に形成されたAde4-mNG顆粒に対する、1,6-hexanediol（HD）の作用を検証。細胞をアデニン無しの培地に移してAde4-mNG顆粒を形成させた後に、さらにdigitoninまたはdigitonin + 10% HDで10分間処理。蛍光顕微鏡観察後、画像処理により顆粒を持つ細胞の割合を計測し、csvファイルで出力。
+
+```{r}
+library(pacman) # パッケージをまとめてロード
+p_load(tidyverse, openxlsx, readxl, ggtext, multcomp, ggsignif, knitr, nparcomp, rstatix, dunn.test, knitr)
+```
+
+***
+顆粒をFIJIのFindMaxima関数で検出する際のパラメータ `prominence`を3種類設定して解析。それぞれのデータを別々のフォルダに保存。
+```{r}
+import_file_path_prom750 <- "prom_750" # prominence=750
+import_file_path_prom875 <- "prom_875" 
+import_file_path_prom1000 <- "prom_1000" 
+```
+
+```{r}
+# 拡張子が.csvのファイルのリストをフルネームで取得（実際はtxtファイル）
+csv_list_prom750 <- list.files(import_file_path_prom750, full.names = TRUE, pattern = "*.csv") 
+csv_list_prom875 <- list.files(import_file_path_prom875, full.names = TRUE, pattern = "*.csv") 
+csv_list_prom1000 <- list.files(import_file_path_prom1000, full.names = TRUE, pattern = "*.csv")
+```
+
+論文には`prominence` = 875のデータを使用。
+`spply()`を使い、ファイル名リストから全てのファイルを一括で読み込み、データフレームのリストを作成。さらに`bind_rows()`でデータフレームを縦に連結して１つにする。
+```{r}
+foci_stat <- csv_list_prom875 %>%
+  sapply(., read.csv, header =TRUE, sep = ",", stringsAsFactors = FALSE, simplify = FALSE) %>% #「.」でcsv_listの位置を明示
+  bind_rows()
+foci_stat <- as_tibble(foci_stat)  # tibble形式にしておく
+```
+
+処理条件を表す変数`condition`を作成する。変数`file_name`中に文字列"hd"または"digit"が含まれる場合、それぞれ変数`condition`の値を`1,6-HD`または`digitonin`とする。それ以外の場合は`untreated`とする。
+```{r}
+foci_stat <-       
+  foci_stat %>% 　　　　　　　　　　
+  mutate(condition =case_when(　　　　　　　　　　　
+    str_detect(file_name, "hd") ~ "1,6-HD",        
+    str_detect(file_name, "digit") ~ "digitonin",   
+    TRUE ~ "untreated"))            
+```
+
+この時点ではconditionが文字列型なので`factor`型に変換しておく、文字列型のままだと後の検定でエラーになる。さらに`fct_relevel()`でレベル順を変更。
+```{r}
+foci_stat$condition <- as_factor(foci_stat$condition)
+foci_stat$condition <- fct_relevel(foci_stat$condition, c("untreated", "digitonin", "1,6-HD"))
+foci_stat
+```
+
+***
+# データの集計
+視野内で顆粒を持つ細胞の割合（%）を表す変数`pct_foci_cell`の平均とSDを求める。また1ｘSDに相当するerror barを書くための範囲を設定。結果をExcelファイルとして保存。
+```{r}
+mean_sd <- foci_stat %>% 
+  group_by(condition) %>% 
+  summarise(mean = mean(pct_foci_cell), sd = sd(pct_foci_cell), N=n())
+limits <- aes(ymax = mean + sd, ymin = mean - sd)
+write.xlsx(mean_sd, "mean_sd.xlsx", colNames = TRUE, sheetName = "221027HD")
+```
+
+視野内で解析した総細胞数`total_cell_number`も集計して、Excelファイルに保存。
+```{r}
+cellnum_per_fv <- 
+  foci_stat %>% summarise(mean = mean(total_cell_number), sd = sd(total_cell_number), max = max(total_cell_number), min=min(total_cell_number),N=n())
+write.xlsx(cellnum_per_fv, "cellnum_per_fv.xlsx", colNames = TRUE, sheetName = "221027HD")
+```
+
+***
+# 統計検定
+3つの群を比較する場合は、geom_signifでは有意差を計算できないので、事前にp値を計算してマニュアルでアノテーションする必要がある。
+3群の全ての組み合わせで比較するので`aov()`関数で分散分析後に、`multcomp`パッケージの`glht()`関数を使用してTukey-Kramer法で検定する。結果はリストでまとめられて出力されるが、p値自体は`summary()`で確認する必要がある。
+```{r}
+res_aov <- aov(pct_foci_cell ~ condition, data = foci_stat)   # condition間で分散分析
+summary(res_aov)
+res_tk <- glht(res_aov, linfct = mcp(condition = "Tukey"), alternative = "two.sided")  # "Dunnett"にするとDunnettの多重検定
+summary(res_tk)
+```
+
+***
+# データの可視化
+顆粒を持つ細胞の割合の平均値を棒グラフで、1SDをエラーバーで描画。個々のデータ点もプロット。検定の結果も表示。
+```{r message=FALSE, warning=FALSE}
+# 検定結果のp値をマニュアルでアノテーションするのに必要なオブジェクトを作成。
+annot1 = c("<0.001", "<0.001", "0.02")  
+y_position = c(98,103,107)
+xmin = c(1, 2, 1)
+xmax = c(3, 3, 2)
+
+plot1 <- mean_sd %>% ggplot(aes(x= condition, y=mean))+
+  geom_bar(aes(fill=condition), stat="identity",
+           color="black",width = 0.8, position = position_dodge(width = 0.6)) + # colorは枠線の色、widthでバーの幅
+  geom_signif(xmin = xmin, xmax =xmax, y_position =y_position,annotation = annot1, textsize = 3, tip_length = 0.01)+
+  scale_fill_manual(values = c('#deebf7','#9ecae1','#3182bd'))+
+  geom_errorbar(limits, width = 0.2, position = position_dodge(width = 0.6), size = 0.5) + 
+  geom_jitter(foci_stat, mapping=aes(x=condition, y= pct_foci_cell),size = 1,
+              alpha=0.7, width = 0.1, height = 0)+
+  ylab("% cells with Ade4-mNG granules") +   ## y軸のラベル
+  xlab("")+                   ## x軸のラベル
+  ylim(0,110)+                  ## y軸のレンジ
+  theme( axis.title.y = element_text(size=12), axis.text.y = element_text(size=12,color = "black"),
+         axis.title.x = element_text(size=12), axis.text.x = element_text(size=12,color = "black")
+         ,legend.position = "none" #凡例を消す
+         ,panel.border = element_rect(fill = NA, size = 0.5)# パネルを枠で囲む
+         ,panel.background = element_blank()) #背景を白にする
+plot1
+```
+
+***  
+
+# 正規性の検証
+全てのデータが正規分布に従っていると仮定して統計検定を行ったが、プロットを見る限り、正規分布とは言い難い。そこでShapiro-Wilk検定でデータの正規性を検証する。
+```{r}
+# conditionの種類をベクトルとして取り出しておく
+conds <- levels(foci_stat$condition)
+# あるconditionの値に対応するpct_foci_cellの値の分布をshapiro.test()で検定するための関数を作成
+st <- function(cond) {foci_stat %>% 
+  filter(condition == cond) %>% 
+  dplyr::select(pct_foci_cell) %>%  
+  as_vector() %>% 
+  shapiro.test()}
+st("untreated") # 関数のテスト
+```
+`lapply()`で`conds`の各要素を自作関数`st`に入力して、計算結果をリストにまとめて出力。
+```{r}
+st_result <- lapply(conds, st)
+names(st_result) <- conds  # リストの要素の名前をつける
+```
+結果をテキストファイルに保存。
+```{r}
+sink("result_shapiro_test.txt")
+for (cond in conds){   # st_resultの要素を順番にコンソールに表示
+  print(st_result[cond])
+}
+sink()
+```
+検定の結果、`condition = digitonin`以外の群ではp値<0.05となり、正規性があるとは言えないことが示唆された。従って、ノンパラメトリックな手法で統計解析をやり直す。ノンパラメトリックな分散分析にはKruskal-Wallis検定を使用する。
+```{r}
+aov_kw <- kruskal.test(data = foci_stat, pct_foci_cell ~ condition)
+sink("res_aov_kw.txt") # p<0.05よりグループ間に違いがあることを示唆
+aov_kw
+sink()
+```
+
+Tukey法のノンパラメトリック版としてSteel-Dwass testで多重比較する。`nparcomp`パッケージの`nparcomp()`を使用。
+```{r}
+res_sd <- foci_stat %>% nparcomp(pct_foci_cell ~ condition, data = .,
+            asy.method = "mult.t",
+             type = "Tukey",alternative = "two.sided", info = FALSE)
+res_sd$Analysis$p.Value %>% signif(., digits = 3)  # p値の確認
+sink("result_sd_test.txt")
+summary(res_sd)
+sink()
+```
+
+再検定結果のp値をもとにアノテーションに必要なオブジェクトを作成。グラフを再度作成。
+```{r}
+annot2 = c("<0.001", "<0.001", "NS")
+y_position = c(98,103,107)
+xmin = c(1, 2, 1)
+xmax = c(3, 3, 2)
+
+plot2 <- mean_sd %>% ggplot(aes(x= condition, y=mean))+
+  geom_bar(aes(fill=condition), stat="identity",
+           color="black",width = 0.8, position = position_dodge(width = 0.6)) + # colorは枠線の色、widthでバーの幅
+  geom_signif(xmin = xmin, xmax =xmax, y_position =y_position,annotation = annot2, textsize = 3, tip_length = 0.01)+
+  scale_fill_manual(values = c('#deebf7','#9ecae1','#3182bd'))+
+  geom_errorbar(limits, width = 0.2, position = position_dodge(width = 0.6), size = 0.5) + 
+  geom_jitter(foci_stat, mapping=aes(x=condition, y= pct_foci_cell),size = 1,
+              alpha=0.7, width = 0.1, height = 0)+
+  ylab("% cells with Ade4-mNG granules") +   ## y軸のラベル
+  xlab("")+                   ## x軸のラベル
+  ylim(0,110)+                  ## y軸のレンジ
+  theme( axis.title.y = element_text(size=12), axis.text.y = element_text(size=12,color = "black"),
+         axis.title.x = element_text(size=12), axis.text.x = element_text(size=12,color = "black")
+         ,legend.position = "none" #凡例を消す
+         ,panel.border = element_rect(fill = NA, size = 0.5)# パネルを枠で囲む
+         ,panel.background = element_blank()) #背景を白にする
+plot2
+```
+
+***
+`geom_signif`内で比較するグループとアノテーションを指定することでも、p値を表すことができる。
+
+```{r}
+# 比較するグループの指定
+comparisons <- list(c("untreated", "1,6-HD"), c("digitonin", "1,6-HD"), c("untreated", "digitonin"))
+
+plot3 <- mean_sd %>% ggplot(aes(x= condition, y=mean))+
+  geom_bar(aes(fill=condition), stat="identity",
+           color="black",width = 0.8, position = position_dodge(width = 0.6)) + 
+  # step_increaseは組み合わせのバーをどれだけずらすかの値
+  geom_signif(comparisons = comparisons, step_increase = 0.05, 
+              annotations = annot2, textsize = 3, tip_length = 0.01) +
+  
+  scale_fill_manual(values = c('#deebf7','#9ecae1','#3182bd'))+
+  geom_errorbar(limits, width = 0.2, position = position_dodge(width = 0.6), size = 0.5) + 
+  geom_jitter(foci_stat, mapping=aes(x=condition, y= pct_foci_cell),size = 1,
+              alpha=0.7, width = 0.1, height = 0)+
+  ylab("% cells with Ade4-mNG granules") +   ## y軸のラベル
+  xlab("")+                   ## x軸のラベル
+  # ylim(0,110)+                  ## y軸のレンジ
+  theme( axis.title.y = element_text(size=12), axis.text.y = element_text(size=12,color = "black"),
+         axis.title.x = element_text(size=12), axis.text.x = element_text(size=12,color = "black")
+         ,legend.position = "none" #凡例を消す
+         ,panel.border = element_rect(fill = NA, size = 0.5)# パネルを枠で囲む
+         ,panel.background = element_blank()) #背景を白にする
+plot3
+
+```
+
+***   
+
+# 入れ子データを使用した解析
+
+上記では元データと要約統計量を別のデータフレームに格納して解析していた。tibbleと`nest()`を利用して、全てのデータを1つのtibbleにまとめて解析することを試みる。
+```{r}
+# 元データの用意
+import_file_path_prom875 <- "prom_875" 
+csv_list_prom875 <- list.files(import_file_path_prom875, full.names = TRUE, pattern = "*.csv") 
+dat <- csv_list_prom875 %>%
+  #「.」でcsv_listの位置を明示
+  sapply(., read.csv, header =TRUE, sep = ",", stringsAsFactors = FALSE, simplify = FALSE) %>% 
+  bind_rows()
+dat <- as_tibble(dat)  # tibble形式にしておく
+dat <-       
+  dat %>% 　　　　　　　　　　
+  mutate(condition =case_when(　　　　　　　　　　　
+    str_detect(file_name, "hd") ~ "1,6-HD",        
+    str_detect(file_name, "digit") ~ "digitonin",   
+    TRUE ~ "untreated"))   
+dat$condition <- as_factor(dat$condition)
+dat$condition <- fct_relevel(dat$condition, c("untreated", "digitonin", "1,6-HD"))
+dat
+```
+`group_nest()`を使用して`condition`でグループ分けして、畳み込み。
+```{r}
+dat_nest <- dat %>% 
+  group_nest(condition)
+dat_nest
+```
+`pct_foci_cell`の平均とSDを計算。サンプルサイズの計算には`dplyr::n()`ではなく`nrow()`を使う。また視野内で観察した細胞数`total_cell_number`についても平均とSD、および合計を求めておく。
+```{r}
+dat_nest <- dat_nest %>%  
+mutate(mean = map_dbl(data, ~ mean(.$pct_foci_cell)),
+         sd = map_dbl(data, ~ sd(.$pct_foci_cell)),
+         N = map_int(data, ~ nrow(.)),
+       cell_num_mean = map_dbl(data, ~ mean(.$total_cell_number)),
+       cell_num_sd = map_dbl(data, ~ sd(.$total_cell_number)),
+       cell_num_sum = map_int(data, ~ sum(.$total_cell_number)))
+dat_nest %>% 
+  dplyr::select(-data) %>% 
+  kable(format ="markdown")
+```
+各サブデータの`pct_foci_cell`の分布に正規性があるかどうかを、Shapiro-Wilk検定で検証する。関数`shapiro.test()`を使用し、結果のリストを変数`swtest`に格納。さらにp値を取り出す。
+```{r}
+dat_nest <- dat_nest %>% 
+  mutate(swtest = map(data, ~ shapiro.test(.$pct_foci_cell)), # 返り値がリストなのでmapを使用
+         sw_pval = map_dbl(swtest, ~.$p.value)) %>% 
+  dplyr::select(condition, mean:cell_num_sum, sw_pval, everything()) # 見やすいように列を並べ替える
+dat_nest %>% 
+  dplyr::select(-data, -swtest) %>% 
+  kable(format = "markdown")
+```
+p値<0.05となるconditionがあるため、正規性があるとは言えないことが示唆された。従ってノンパラメトリックな手法で統計解析する。ノンパラメトリックな分散分析にはKruskal-Wallis検定を使用する。サブデータ間の比較なのでdat_nestではなくdatそのものを使用するので省略。続いてノンパラメトリックなTukey検定であるSteel-Dwass多重検定もdatを使用するので省略。 
+
+***   
+
+`dat_nest`をExcelファイルに保存する際は、リスト列`data`を除去しないとエラーになる。
+```{r}
+dat_nest %>% 
+  dplyr::select(-data) %>% 
+  write.xlsx(., "nest_mean_sd.xlsx", colNames = TRUE, sheetName = "221027HD")
+```
+***   
+`dat_nest`だけを使用してデータをプロットする。`unnest(dat_nest, cols = data)`は`dat`と書いた方が簡単。
+```{r}
+annot2 = c("<0.001", "<0.001", "NS")
+y_position = c(98,103,107)
+xmin = c(1, 2, 1)
+xmax = c(3, 3, 2)
+comparisons <- list(c("untreated", "1,6-HD"), c("digitonin", "1,6-HD"), c("untreated", "digitonin"))
+
+plot4 <- dat_nest %>%
+  ggplot(aes(x= condition, y=mean))+
+  geom_bar(aes(fill=condition), stat="identity",
+           color="black",width = 0.8, position = position_dodge(width = 0.6)) + 
+  # step_increaseは組み合わせのバーをどれだけずらすかの値
+  geom_signif(comparisons = comparisons, step_increase = 0.05,
+              annotations = annot2, textsize = 3, tip_length = 0.01) +
+  scale_fill_manual(values = c('#deebf7','#9ecae1','#3182bd'))+
+  geom_errorbar(aes(ymax = mean + sd, ymin = mean - sd), width = 0.2, position = position_dodge(width = 0.6), size = 0.5) + 
+  geom_jitter(unnest(dat_nest, cols = data), mapping=aes(x=condition, y= pct_foci_cell),size = 1,
+  alpha=0.7, width = 0.1, height = 0)+
+  ylab("% cells with Ade4-mNG granules") +   ## y軸のラベル
+  xlab("")+                   ## x軸のラベル
+  # ylim(0,110)+                  ## y軸のレンジ
+  theme( axis.title.y = element_text(size=12), axis.text.y = element_text(size=12,color = "black"),
+         axis.title.x = element_text(size=12), axis.text.x = element_text(size=12,color = "black")
+         ,legend.position = "none" #凡例を消す
+         ,panel.border = element_rect(fill = NA, size = 0.5)# パネルを枠で囲む
+         ,panel.background = element_blank()) #背景を白にする
+plot4
+```
+

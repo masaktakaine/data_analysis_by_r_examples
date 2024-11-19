@@ -1,0 +1,208 @@
+---
+title: "Ade4顆粒形成におけるラパマイシンの作用"
+author: "MT"
+date: "2022-10-27"
+output:
+  html_document: 
+    number_section: yes
+    toc: yes
+    toc_float: yes
+    highlight: textmate
+    theme: lumen
+  word_document:
+    toc: yes
+    toc_depth: '3'
+  pdf_document:
+    toc: yes
+    toc_depth: '3'
+  always_allow_html: yes
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+```{r klippy, echo=FALSE, include=TRUE}
+klippy::klippy(position = c('top', 'right'))  ## コードのコピーボタンを作成、PDFやWordでKnitする際はコメントアウトする
+```
+---
+# この事例で扱うデータと統計
+**カテゴリ変数**：細胞の処理条件 `condition`（DMSO, Rapamycin）  
+**数値変数**： Ade4顆粒を持つ細胞の割合（%）`pct_foci_cell`  
+**グラフ**：棒グラフ（平均） + エラーバー（1SD） + ドットプロット（各データポイント）  
+**統計**：Welchのt-test（等分散を仮定しないt-test、パラメトリック）、Shapiro-Wilk検定によるデータの正規性の検証、Mann-Whitney U-test（ノンパラメトリック）
+
+# データの取得と読み込み
+Ade4-mNG顆粒形成におけるラパマイシンの作用を検証。細胞をアデニン無しの培地に移すと同時にラパマイシンを作用させ、30分後に蛍光顕微鏡観察。画像処理により顆粒を持つ細胞の割合を計測し、csvファイルで出力。
+
+```{r}
+library(pacman) # パッケージをまとめてロード
+p_load(tidyverse, openxlsx, readxl, ggtext, multcomp, ggsignif, knitr, nparcomp)
+```
+
+***
+顆粒をFIJIのFindMaxima関数で検出する際のパラメータ `prominence`を3種類設定して解析。それぞれのデータを別々のフォルダに保存。
+```{r}
+# 3回の実験から得られたfoci_stat.csvをまとめたフォルダ
+import_file_path_prom750 <- "prom_750" # prominence=750
+import_file_path_prom875 <- "prom_875" # prom875
+import_file_path_prom1000 <- "prom_1000" # prom875
+```
+```{r}
+# 拡張子が.csvのファイルのリストをフルネームで取得（実際はtxtファイル）
+csv_list_prom750 <- list.files(import_file_path_prom750, full.names = TRUE, pattern = "*.csv") 
+csv_list_prom875 <- list.files(import_file_path_prom875, full.names = TRUE, pattern = "*.csv") 
+csv_list_prom1000 <- list.files(import_file_path_prom1000, full.names = TRUE, pattern = "*.csv") 
+```
+
+論文には`prominence` = 750のデータを使用。
+`spply()`を使い、ファイル名リストから全てのファイルを一括で読み込み、データフレームのリストを作成。さらに`bind_rows()`でデータフレームを縦に連結して１つにする。
+```{r}
+foci_stat <- csv_list_prom750 %>%  #「.」でcsv_listの位置を明示
+  sapply(., read.csv, header =TRUE, sep = ",", stringsAsFactors = FALSE, simplify = FALSE) %>%
+  bind_rows()
+foci_stat <- as_tibble(foci_stat)  # tibble形式にしておく
+```
+
+処理条件を表す変数`condition`を作成する。変数`file_name`中に文字列"dmso"または"rapa"が含まれる場合、それぞれ変数`condition`の値を`DMSO`または`Rapamycin`とする。
+```{r}
+foci_stat <- foci_stat %>% 　　　　　　　　　　　
+  mutate(condition =case_when(　　　
+    str_detect(file_name, "dmso") ~ "DMSO",         
+    str_detect(file_name, "rapa") ~ "Rapamycin"))
+```
+
+この時点ではconditionが文字列型なので`factor`型に変換しておく、文字列型のままだと後の検定でエラーになる。さらに`fct_relevel()`でレベル順を変更。
+```{r}
+foci_stat$condition <- as_factor(foci_stat$condition)
+foci_stat$condition <- fct_relevel(foci_stat$condition, c("DMSO", "Rapamycin"))
+foci_stat
+```
+
+***
+# データの集計
+視野内で顆粒を持つ細胞の割合（%）を表す変数`pct_foci_cell`の平均とSDを求める。また1ｘSDに相当するerror barを書くための範囲を設定。結果をExcelファイルとして保存。
+```{r}
+mean_sd <- foci_stat %>% 
+  group_by(condition) %>% 
+  summarise(mean = mean(pct_foci_cell), sd = sd(pct_foci_cell), N=n())
+limits <- aes(ymax = mean + sd, ymin = mean - sd)
+write.xlsx(mean_sd, "mean_sd.xlsx", colNames = TRUE, sheetName = "221027")
+```
+
+視野内で解析した総細胞数`total_cell_number`も集計して、Excelファイルに保存。
+```{r}
+cellnum_per_fv <- 
+  foci_stat %>% summarise(mean = mean(total_cell_number), sd = sd(total_cell_number), max = max(total_cell_number), min=min(total_cell_number),N=n())
+write.xlsx(cellnum_per_fv, "cellnum_per_fv.xlsx", colNames = TRUE, sheetName = "221027")
+```
+
+***
+# データの可視化
+顆粒を持つ細胞の割合の平均値を棒グラフで、1SDをエラーバーで描画。個々のデータ点もプロット。さらにWelch t-test（等分散を仮定しない、対応の無い2群、両側検定）の結果も表示。
+```{r message=FALSE, warning=FALSE}
+plot1 <- mean_sd %>% 
+  ggplot(aes(x= condition, y=mean))+
+  geom_bar(aes(fill = condition), stat="identity", 
+           color="black",width = 0.6,  # colorは枠線の色、widthでバーの幅
+           position = position_dodge(width = 0.6)) + # position_dodge(width)でバー間の距離を規定
+  geom_signif(data=foci_stat, mapping = aes(x = condition, y = pct_foci_cell),
+              comparisons = list(c("DMSO", "Rapamycin")), textsize = 4,
+              test.args=list(alternative = "two.sided",  # 両側検定
+                             var.equal = FALSE, paired=FALSE), # 等分散を仮定しない Welch t-test 、対応の無い2群
+              test = "t.test", map_signif_level = FALSE, step_increase = 0, tip_length = 0.01)+ 
+  # scale_fill_manual(values = c('#bdbdbd','#e6550d')) + # fillの色を手動で指定
+    scale_fill_manual(values = c("#a9a9ac","#F8766D"))+
+  geom_errorbar(limits, width = 0.2, position = position_dodge(width=0.6))+ 
+  geom_jitter(foci_stat, mapping = aes(x = condition, y = pct_foci_cell), size = 2,
+              alpha=0.7, width = 0.1, height = 0) + # height = 0にしないとy軸上に散らばり不正確になる
+  ylab("% cells with Ade4-mNG granules") +   ## y軸のラベル
+  xlab("")+                   ## x軸のラベル
+  theme( axis.title.y = element_text(size=12), axis.text.y = element_text(size=12,color = "black"),
+         axis.title.x = element_text(size=12), axis.text.x = element_text(size=12,color = "black")
+         ,legend.position = "none" #凡例を消す
+         ,panel.border = element_rect(fill = NA, size = 0.5)# パネルを枠で囲む
+         ,panel.background = element_blank()) #背景を白にする
+plot1
+```
+
+***
+検定結果の詳細が知りたい場合、`t.test()`関数で別途検定を行う。結果はリストでまとめられて出力される。
+```{r}
+welch_test_res <- foci_stat %>% 
+  t.test(pct_foci_cell ~ condition, data =.,  # data=. としないとエラーになる
+            alternative = "two.sided", paired = FALSE, var.equal = FALSE)  # 片側検定は"g"または"l"
+str(welch_test_res)
+welch_test_res$p.value  # p値
+```
+sink()関数を使用して、結果をテキストファイルに保存する。2回目のsink()が実行されるまでにコンソールに出力された内容が、txtファイルに保存される。
+```{r}
+sink("welch_test_res.txt")
+welch_test_res  # 結果の要約がコンソールに表示される
+sink()
+```
+
+***
+# 正規性の検証
+以上の解析ではデータが正規分布に従うと仮定していたが、プロットを見る限りでは正規分布とは言い難い。そこで改めてShapiro-Wilk検定でデータの正規性を検証。
+```{r}
+# conditionの種類をベクトルとして取り出しておく
+conds <- levels(foci_stat$condition)
+st <- function(cond) {foci_stat %>%
+# あるconditionの値に対応するpct_foci_cellの値の分布をshapiro.test()で検定するための関数を作成
+  filter(condition == cond) %>% 
+  dplyr::select(pct_foci_cell) %>%  
+  as_vector() %>% 
+  shapiro.test()}
+st("DMSO") # 関数のテスト
+```
+
+lapply()でcondsの各要素を自作関数stに入力して、計算結果をリストにまとめて出力。
+```{r}
+st_result <- lapply(conds, st)
+names(st_result) <- conds  # リストの要素の名前をつける
+```
+
+結果をテキストファイルに保存。いずれの場合もp<0.05なので正規分布に従っているとは言えない。
+```{r}
+sink("result_shapiro_test.txt")
+for (cond in conds){   # st_resultの要素を順番にコンソールに表示
+  print(st_result[cond])
+}
+sink()
+```
+
+ノンパラメトリックな2群比較検定であるMann-Whitney testで再比較する。
+```{r}
+res_mw <- foci_stat %>% 
+  wilcox.test(pct_foci_cell ~ condition, data =.,  # data=. としないとエラーになる
+            alternative = "two.sided", paired = FALSE)
+sink("res_mw.txt")
+res_mw
+sink()
+```
+
+プロットを再作成。
+```{r}
+plot2 <- mean_sd %>% 
+  ggplot(aes(x= condition, y=mean))+
+  geom_bar(aes(fill = condition), stat="identity", 
+           color="black",width = 0.6,  # colorは枠線の色、widthでバーの幅
+           position = position_dodge(width = 0.6)) + # position_dodge(width)でバー間の距離を規定
+  # マニュアルでp値をアノテーション
+  geom_signif(comparisons = list(c("DMSO", "Rapamycin")), textsize = 4, annotations = c("1.7e-09"), tip_length = 0.01) +
+  # scale_fill_manual(values = c('#bdbdbd','#e6550d')) + # fillの色を手動で指定
+      scale_fill_manual(values = c("#bdbdbd", "#F8766D"))+
+  ylim(c(0, 110))+
+  geom_errorbar(limits, width = 0.2, position = position_dodge(width=0.6))+ 
+  geom_jitter(foci_stat, mapping = aes(x = condition, y = pct_foci_cell), size = 2,
+              alpha=0.7, width = 0.1, height = 0) + # height = 0にしないとy軸上に散らばり不正確になる
+  ylab("% cells with Ade4-mNG granules") +   ## y軸のラベル
+  xlab("")+                   ## x軸のラベル
+  theme( axis.title.y = element_text(size=14), axis.text.y = element_text(size=14,color = "black"),
+         axis.title.x = element_text(size=14), axis.text.x = element_text(size=14,color = "black")
+         ,legend.position = "none" #凡例を消す
+         ,panel.border = element_rect(fill = NA, size = 0.5)# パネルを枠で囲む
+         ,panel.background = element_blank()) #背景を白にする
+plot2
+ggsave("plot%02d.png", width = 250, height = 325, dpi = 72, units = "px")
+```

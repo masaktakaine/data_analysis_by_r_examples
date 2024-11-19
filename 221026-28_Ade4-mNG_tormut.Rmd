@@ -1,0 +1,206 @@
+---
+title: "TORC1関連変異株におけるAde4顆粒形成効率の解析"
+author: "MT"
+date: "2022-10-28"
+output:
+  html_document: 
+    number_section: yes
+    toc: yes
+    toc_float: yes
+    highlight: textmate
+    theme: lumen
+  word_document:
+    toc: yes
+    toc_depth: '3'
+  pdf_document:
+    toc: yes
+    toc_depth: '3'
+  always_allow_html: yes
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r klippy, echo=FALSE, include=TRUE}
+klippy::klippy(position = c('top', 'right'))  ## コードのコピーボタンを作成、PDFやWordでKnitする際はコメントアウトする
+```
+---
+# この事例で扱うデータと統計
+**カテゴリ変数**：`strain`（WT, sfp1∆, sit4∆）  
+**数値変数**： Ade4顆粒を持つ細胞の割合（%）`pct_foci_cell`  
+**グラフ**：棒グラフ（平均） + エラーバー（1SD） + ドットプロット（各データポイント）  
+**統計**：Dunnettの多重検定（パラメトリック）、Shapiro-Wilk検定による正規性の検証、Steelの多重検定（ノンパラメトリック）
+
+# データの取得と読み込み
+TORC1の下流因子であるSfp1とSit4の遺伝子破壊株におけるAde4顆粒形成を観察、野生株と顆粒形成効率を比較する。蛍光顕微鏡観察後、画像処理により顆粒を持つ細胞の割合を計測し、csvファイルで出力。
+
+```{r}
+library(pacman)
+p_load(tidyverse, openxlsx, readxl, ggtext, multcomp, ggsignif, knitr, nparcomp, rstatix, dunn.test)  # パッケージをまとめてロード
+```
+
+***
+顆粒をFIJIのFindMaxima関数で検出する際のパラメータ `prominence`を3種類設定して解析。それぞれのデータを別々のフォルダに保存。
+```{r}
+import_file_path_prom750 <- "prom_750" # prominence=750, 3回の実験から得られたfoci_stat.csvをまとめたフォルダ
+import_file_path_prom875 <- "prom_875" 
+import_file_path_prom1000 <- "prom_1000" 
+```
+```{r}
+# 拡張子が.csvのファイルのリストをフルネームで取得（実際はtxtファイル）
+csv_list_prom750 <- list.files(import_file_path_prom750, full.names = T, pattern = "*.csv") 
+csv_list_prom875 <- list.files(import_file_path_prom875, full.names = T, pattern = "*.csv") 
+csv_list_prom1000 <- list.files(import_file_path_prom1000, full.names = T, pattern = "*.csv")
+```
+
+論文には`prominence` = 750のデータを使用。
+`spply()`を使い、ファイル名リストから全てのファイルを一括で読み込み、データフレームのリストを作成。さらに`bind_rows()`でデータフレームを縦に連結して１つにする。
+
+```{r}
+foci_stat <- csv_list_prom750 %>%
+  sapply(., read.csv, header =TRUE, sep = ",", stringsAsFactors = FALSE, simplify = FALSE) %>% #「.」でcsv_listの位置を明示
+  bind_rows()
+foci_stat <- as_tibble(foci_stat)  # tibble形式にしておく
+```
+
+株を表す変数`strain`を作成する
+```{r}
+foci_stat <-       
+  foci_stat %>% 　　　　　　　　　　
+  mutate(strain =case_when(　　　　　　　　　　　
+    str_detect(file_name, "wt") ~ "WT",         
+    str_detect(file_name, "sfp1") ~ "sfp1∆",   
+    TRUE ~ "sit4∆"))  # 上2つの条件に当てはまらない場合                    
+
+foci_stat$strain <- as_factor(foci_stat$strain)
+# この時点ではstrainが文字列型なのでfactor型に変換しておく、文字列型のママだと多重検定でエラーになる
+foci_stat$strain <- fct_relevel(foci_stat$strain, c("WT", "sfp1∆", "sit4∆"))  ## fct_relevelでレベル順を変更
+foci_stat
+```
+
+***
+# データの集計
+視野内で顆粒を持つ細胞の割合（%）を表す変数`pct_foci_cell`の平均とSDを求める。また1ｘSDに相当するerror barを書くための範囲を設定。結果をExcelファイルとして保存。
+```{r}
+mean_sd <- foci_stat %>% 
+  group_by(strain) %>% 
+  summarise(mean = mean(pct_foci_cell), sd = sd(pct_foci_cell), N=n())
+limits <- aes(ymax = mean + sd, ymin = mean - sd)
+write.xlsx(mean_sd, "mean_sd.xlsx", colNames = TRUE, sheetName = "221026_tormut")
+```
+
+***
+# 統計検定
+3つの群を比較する場合は、geom_signifでは有意差を計算できないので、事前にp値を計算してマニュアルでアノテーションする必要がある。
+3群の全ての組み合わせで比較するので`aov()`関数で分散分析後に、`multcomp`パッケージの`glht()`関数を使用してDunnett法で検定する。結果はリストでまとめられて出力されるが、p値自体は`summary()`で確認する必要がある。
+```{r}
+# strain間で分散分析
+res_aov <- aov(pct_foci_cell ~ strain, data = foci_stat)
+summary(res_aov)
+res_dn <- glht(res_aov, linfct = mcp(strain = "Dunnett"), alternative = "two.sided")
+summary(res_dn)
+```
+
+***
+# データの可視化
+顆粒を持つ細胞の割合の平均値を棒グラフで、1SDをエラーバーで描画。個々のデータ点もプロット。検定の結果も表示。
+```{r message=FALSE, warning=FALSE}
+# 検定結果のp値をマニュアルでアノテーションするのに必要なオブジェクトを作成
+  annot1 = c("6.6e-10", "3.1e-8")
+  y_position = c(98,103)
+  xmin = c(1, 1)
+  xmax = c(2, 3)
+
+  plot1 <- mean_sd %>% ggplot(aes(x= strain, y=mean))+
+    geom_bar(aes(fill=strain),stat="identity", color="black", # colorは枠線の色
+             width = 0.75, position = position_dodge(width = 0.6)) + # widthでバーの幅
+  geom_errorbar(limits, width = 0.2, position = position_dodge(width=0.6)) +
+  geom_signif(xmin = xmin, xmax =xmax, y_position =y_position, annotation = annot1, textsize = 3, tip_length = 0.01) +
+  scale_fill_manual(values = c('#bdbdbd',"#e6550d","#3182bd"))+
+  geom_jitter(foci_stat, mapping=aes(x=strain, y= pct_foci_cell),size = 1.5,
+              alpha=0.7, width = 0.1, height = 0)+
+  # ggtextを使用すると*で囲むと斜体になる、labelsを指定
+  scale_x_discrete(labels=c("wt", "*sfp1∆*", "*sit4∆*")) +
+  ylab("% cells with Ade4-mNG granules") +   ## y軸のラベル
+  xlab("")+                   ## x軸のラベル
+  ylim(0,110)+                  ## y軸のレンジ
+  theme( axis.title.y = element_text(size=12), axis.text.y = element_text(size=12,color = "black"),
+         # ggtextを使用する場合はelement_markdownで指定
+         axis.text.x = element_markdown(size = 12,colour = "black") 
+         ,legend.position = "none" #凡例を消す
+         ,panel.border = element_rect(fill = NA, size = 0.5) # パネルを枠で囲む
+         ,panel.background = element_blank()) #背景を白にする
+plot1
+```
+
+***
+# 正規性の検証
+全てのデータが正規分布に従っていると仮定して統計検定を行ったが、プロットを見る限り、正規分布とは言い難い。そこでShapiro-Wilk検定でデータの正規性を検証する。
+```{r}
+# strainの種類をベクトルとして取り出しておく
+strains <- levels(foci_stat$strain) 
+# あるstrainの値に対応するpct_foci_cellの値の分布をshapiro.test()で検定するための関数を作成
+st <- function(astrain) {foci_stat %>% 
+  filter(strain == astrain) %>% 
+  dplyr::select(pct_foci_cell) %>%  
+  as_vector() %>% 
+  shapiro.test()}
+st("WT") # 関数のテスト
+```
+`lapply()`で`conds`の各要素を自作関数`st`に入力して、計算結果をリストにまとめて出力。
+```{r}
+st_result <- lapply(strains, st)
+names(st_result) <- strains  # リストの要素の名前をつける
+```
+結果をテキストファイルに保存。
+```{r}
+sink("result_shapiro_test.txt")
+for (astrain in strains){   # st_resultの要素を順番にコンソールに表示
+  print(st_result[astrain])
+}
+sink()
+```
+検定の結果、全ての`strain`でp値<0.05となり、正規性があるとは言えないことが示唆された。従って、ノンパラメトリックな手法で統計解析をやり直す。ノンパラメトリックな分散分析にはKruskal-Wallis検定を使用する。
+```{r}
+aov_kw <- kruskal.test(data = foci_stat, pct_foci_cell ~ strain)
+sink("res_aov_kw.txt") # p<0.05よりグループ間に違いがあることを示唆
+aov_kw
+sink()
+```
+
+Dunnett法のノンパラメトリック版としてSteel testで多重比較する。`nparcomp`パッケージの`nparcomp()`を使用。
+```{r}
+res_st <- foci_stat %>% nparcomp(pct_foci_cell ~ strain, data = .,
+            asy.method = "mult.t",
+             type = "Dunnett",control = "WT", alternative = "two.sided", info = FALSE)
+
+sink("result_st_test.txt")
+summary(res_st)
+sink()
+res_st$Analysis$p.Value %>% signif(., digits = 3)  # p値の確認
+```
+
+再検定結果のp値をもとにアノテーションに必要なオブジェクトを作成。グラフを再度作成。
+```{r}
+annot2 = c("4.4e-8", "7.9e-6")
+ y_position = c(98,105)
+plot2 <- mean_sd %>% ggplot(aes(x= strain, y=mean))+
+    geom_bar(aes(fill=strain),stat="identity", color="black",width = 0.75, position = position_dodge(width = 0.6)) +
+  geom_errorbar(limits, width = 0.2, position = position_dodge(width=0.6)) +
+  geom_signif(xmin = xmin, xmax =xmax, y_position =y_position, annotation = annot2, textsize = 4, tip_length = 0.01) +
+  # scale_fill_manual(values = c('#bdbdbd',"#e6550d","#3182bd"))+
+   scale_fill_manual(values = c("#bdbdbd", "#F8766D","#5da6f4"))+
+  geom_jitter(foci_stat, mapping=aes(x=strain, y= pct_foci_cell),size = 1.5,
+              alpha=0.7, width = 0.1, height = 0)+
+  scale_x_discrete(labels=c("wt", "*sfp1∆*", "*sit4∆*")) + 
+  ylab("% cells with Ade4-mNG granules") +   ## y軸のラベル
+  xlab("")+                   ## x軸のラベル
+  ylim(0,110)+                  ## y軸のレンジ
+  theme( axis.title.y = element_text(size=14), axis.text.y = element_text(size=14,color = "black"),
+         axis.text.x = element_markdown(size = 14,colour = "black") 
+         ,legend.position = "none" #凡例を消す
+         ,panel.border = element_rect(fill = NA, size = 0.5) # パネルを枠で囲む
+         ,panel.background = element_blank()) #背景を白にする
+plot2
+```

@@ -1,0 +1,329 @@
+---
+title: "In vitroにおけるAde4粒子形成に対する各種プリンの作用"
+author: "MT"
+date: "2023-01-18"
+output:
+  html_document: 
+    number_section: yes
+    toc: yes
+    toc_float: yes
+    highlight: textmate
+    theme: lumen
+  word_document:
+    toc: yes
+    toc_depth: '3'
+  pdf_document:
+    toc: yes
+    toc_depth: '3'
+  always_allow_html: yes
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r klippy, echo=FALSE, include=TRUE}
+klippy::klippy(position = c('top', 'right'))  ## コードのコピーボタンを作成、PDFやWordでKnitする際はコメントアウトする
+```
+---
+# この事例で扱うデータと統計
+**カテゴリ変数**：作用させたプリンヌクレオチド:`metabolite`（mock, SAMP, GMP, AMP, ADP, ATP）  
+**数値変数**： 1視野内の粒子の輝度の総和:`sum_intden`, 1視野内の粒子の輝度の平均値:`mean_mean`  
+**グラフ**：棒グラフ（平均） + エラーバー（1SD） + ドットプロット（各データポイント）  
+**統計**：Shapiro-Wilk検定による正規性の検証、パラメトリックな1元配置分散分析、Tukey-Kramerの多重検定
+
+# データの取得と読み込み
+In vitroのAde4-mNG粒子形成に対する各種プリンヌクレオチドの作用を観察。蛍光顕微鏡観察後、画像処理により粒子の蛍光強度を計測し、csvファイルで出力。
+
+```{r}
+library(pacman)
+# パッケージをまとめてロード
+p_load(tidyverse, openxlsx, readxl, ggtext, multcomp, ggsignif, knitr, nparcomp, rstatix, dunn.test)
+```
+
+読み込むcsvファイルが入っているフォルダを指定。ファイル名リストを取得。
+```{r}
+import_file_path <- "2023-01-18_ivc_metabolites_csv"   
+csv_list<- list.files(import_file_path, full.names = TRUE, recursive = TRUE, pattern = "*.csv")
+```
+`spply()`を使い、ファイル名リストから全てのファイルを一括で読み込み、データフレームのリストを作成。さらに`bind_rows()`でデータフレームを縦に連結して１つにする。
+```{r}
+mergedf <- csv_list %>%
+  sapply(., read.csv, header =TRUE, sep = ",", stringsAsFactors = F, simplify = F) %>%
+  bind_rows()
+```
+
+`mutate()`で新しい変数`metabolite`を作成。また顕微鏡観察開始時の確認のために撮影したテストデータを除く。
+```{r}
+mergedf <-       
+  mergedf %>% 
+  mutate(metabolite =case_when(　　　　　
+    str_detect(file, "mock") ~ "mock",                  
+    str_detect(file, "samp") ~ "SAMP",         
+    str_detect(file, "amp") ~ "AMP",
+    str_detect(file, "gmp") ~ "GMP",
+    str_detect(file, "adp") ~ "ADP",
+    str_detect(file, "atp") ~ "ATP")
+  )
+# test dataを除く
+mergedf <- mergedf %>% 
+  filter(!is.na(metabolite))
+```
+
+この時点では変数`metabolite`は文字列型なのでfactor型に変換しておく。文字列型だと多重検定でエラーになる。さらにfct_relevelでレベル順を規定する。
+```{r}
+mergedf$metabolite <- as_factor(mergedf$metabolite)  ## 
+mergedf$metabolite <- fct_relevel(mergedf$metabolite, c("mock","SAMP", "GMP","AMP","ADP","ATP"))
+levels(mergedf$metabolite)
+```
+
+# データの集計
+観察した粒子の輝度、総輝度数（輝度×面積）の平均とSDを求める。変数`metabolite`でグループ分け。また1ｘSDに相当するerror barを書くための範囲を設定。
+```{r}
+mean_sd_mean <- 
+  mergedf %>% group_by(metabolite) %>% 
+  summarise(
+    mean_mean = mean(Mean),
+    sd_mean = sd(Mean),
+    N = n()
+  )
+## 1ｘSDに相当するerror barを書くための範囲を設定
+limits_mean <- aes(ymax = mean_mean + sd_mean, ymin = mean_mean - sd_mean) 
+
+mean_sd_intden <- 
+  mergedf %>% group_by(metabolite) %>% 
+  summarise(
+    mean_intden = mean(IntDen),
+    sd_intden = sd(IntDen),
+    N = n()
+  )
+limits_intden <- aes(ymax = mean_intden + sd_intden, ymin = mean_intden - sd_intden) 
+```
+
+***
+粒子の総輝度を1視野（1ファイル）毎に合計した値`sum_intden`を求め、同様に平均とSDを算出。
+```{r message=FALSE, warning=FALSE}
+sum_intden <- 
+  mergedf %>% group_by(metabolite, file) %>% 
+  summarise(
+    sum_intden = sum(IntDen), N_particle=n())
+
+mean_sd_sum_intden <- 
+  sum_intden %>% group_by(metabolite) %>% 
+  summarise(
+    mean_sum_intden = mean(sum_intden),
+    sd_sum_intden = sd(sum_intden),
+# 観察した視野数と1視野あたりの粒子数の平均値を求める
+    N_field = n(), mean_N_particle_per_field = sum(N_particle)/N_field 
+  )
+limits_sum_intden <- aes(ymax = mean_sum_intden + sd_sum_intden, ymin = mean_sum_intden - sd_sum_intden)
+```
+
+***
+粒子の輝度を1視野（1ファイル）毎に平均した値`mean_mean`を求め、同様に平均とSDを算出。
+```{r}
+mean_mean <- 
+  mergedf %>% group_by(metabolite,file) %>% 
+  summarise(
+    mean_mean = mean(Mean), N_particle=n())
+
+mean_sd_mean_mean <- 
+  mean_mean %>% group_by(metabolite) %>% 
+  summarise(
+    mean_mean_mean = mean(mean_mean),
+    sd_mean_mean = sd(mean_mean),
+# 観察した視野数と1視野あたりの粒子数の平均値を求める
+    N_field = n(), mean_N_particle_per_field = sum(N_particle)/N_field 
+  )
+limits_mean_mean <- aes(ymax = mean_mean_mean + sd_mean_mean, ymin = mean_mean_mean - sd_mean_mean) 
+```
+
+***
+平均やSDのデータを1つのExcelファイルにまとめるには、データフレームをリストでまとめて`write.xlsx()`に渡す。リストの要素に名前を付けておくと、それがExcelファイルにおけるシート名になる。
+```{r}
+df_list <- list(mean_sd_mean, mean_sd_intden, mean_sd_sum_intden, mean_sd_mean_mean)
+names(df_list) <- c("mean", "intden", "sum_intden", "mean_mean") # リストの要素に名前を付ける
+write.xlsx(df_list, "mean_sd_concat.xlsx", colNames = TRUE)
+```
+
+# データの正規性の検証
+データが正規分布に従っているかどうか、Shapiro-Wilk検定でデータの正規性を検証する。
+```{r}
+# metaboliteの値をベクトル化しておく
+metabolites <- levels(mergedf$metabolite)
+# mean_meanのデータについて正規性を検証するための関数を作成
+sw_test_mm <- function(metab){mean_mean %>% 
+    ungroup() %>% 
+    filter(metabolite == metab) %>%  
+    dplyr::select(mean_mean) %>%
+    as_vector() %>% # ベクトル型に直す
+    shapiro_test()}
+
+res_swt_mm <- lapply(metabolites, sw_test_mm)
+names(res_swt_mm) <- metabolites # 要素に名前を付けておく
+sink("res_swt_mm.txt") # 結果をテキストファイルで保存
+res_swt_mm
+sink()
+
+# 確認
+res_swt_mm_mock <-
+  mean_mean %>% 
+  filter(metabolite == "mock") %>% 
+  ungroup() %>%
+  dplyr::select(mean_mean) %>% 
+  as_vector() %>% 
+  shapiro_test()
+res_swt_mm_mock
+```
+SAMPとADPがp = 0.06でギリギリだが、全てのp＞0.05なので正規性は棄却されなかった。
+
+***
+```{r}
+# # sum_intdenについてデータの正規性を検証するための関数を作成
+sw_test_si <- function(metab){sum_intden %>% 
+    ungroup() %>% 
+    filter(metabolite == metab) %>%  
+    dplyr::select(sum_intden) %>%
+    as_vector() %>% # ベクトル型に直す
+    shapiro_test()}
+res_swt_si <- lapply(metabolites, sw_test_si)
+names(res_swt_si) <- metabolites
+sink("res_swt_si.txt")
+res_swt_si
+sink()
+
+# 確認
+res_swt_si_mock <- sum_intden %>% 
+  filter(metabolite == "mock") %>% 
+  ungroup() %>% 
+  dplyr::select(sum_intden) %>% 
+  as_vector() %>% 
+  shapiro_test()
+res_swt_si_mock
+```
+全ての`metabolite`においてp>0.05だったので正規性は棄却されなかった。
+
+***
+# パラメトリックな統計検定
+正規性が確認されたのでパラメトリックな手法でデータを統計解析。変数`sum_intden`と`mean_mean`について、まずは`metabolite`間で差があるか分散分析。
+```{r}
+# metabolite間で分散分析
+aov_sum_intden <- aov(sum_intden ~ metabolite, data = sum_intden)
+aov_mean_mean <- aov(mean_mean ~ metabolite, data = mean_mean)
+summary(aov_sum_intden)
+summary(aov_mean_mean)
+```
+いずれの場合もp<0.05なので差がありそう。
+```{r}
+# （参考) anova_test()を使用する場合。
+sum_intden %>% ungroup() %>% anova_test(sum_intden ~ metabolite) # ungroup()する必要がある
+mean_mean %>% ungroup() %>% anova_test(mean_mean ~ metabolite)
+```
+
+***
+Tukey-Kramer法で全てのmetaboliteの群を総当りで比較。`glht()`関数を使用する場合は`aov()`の出力オブジェクトを引数とする。
+```{r}
+aov_sum_intden_tukey <- 
+  glht(aov_sum_intden, linfct = mcp(metabolite = "Tukey"), # "Dunnett"にするとDunnett法による多重検定
+                             # alternative = "l")
+                             alternative = "two.sided")
+sink(file = "tukey_sum_intden.txt") ## sink()を使用して検定結果を出力
+summary(aov_sum_intden_tukey)
+sink()
+
+aov_mean_mean_tukey <- 
+  glht(aov_mean_mean, linfct = mcp(metabolite = "Tukey"),
+                            alternative = "two.sided")
+
+sink(file = "tukey_mean_mean.txt") ## sink()を使用して検定結果を出力
+summary(aov_mean_mean_tukey) 
+sink()
+```
+
+***
+tukey_hsd()関数を使用すると結果をデータフレームで出力。p値の有効数字が大きい。片側検定か両側検定を指定するオプションは無いが、両側検定で計算。
+```{r}
+tukey_hsd_sum_intden <- sum_intden %>%
+  ungroup() %>% tukey_hsd(sum_intden ~ metabolite)
+tukey_hsd_mean_mean <- mean_mean %>%
+  ungroup() %>% tukey_hsd(mean_mean ~ metabolite)
+sink("tukey_hsd_sum_intden.txt")
+tukey_hsd_sum_intden
+sink()
+sink("tukey_hsd_mean_mean.txt")
+tukey_hsd_mean_mean
+sink()
+```
+
+***
+# データの可視化
+sum_intdenやmean_meanの平均値を棒グラフで、1SDをエラーバーで描画。個々のデータ点もプロット。検定の結果も表示。
+```{r}
+## p値を手動で描くための数値を格納するオブジェクト
+  annot1 = c("NS", "***", "***","***","***","***","NS","NS")
+  y_position1 = c(4.15e+06,4.0e+06,3.85e+06,3.7e+06,3.55e+06, 3.2e+06,2.9e+06,2.75e+06)
+  xmin1 = c(1,1,1,1,1,3,4,4)
+  xmax1 = c(2,3,4,5,6,4,5,6)
+  
+plot_si <- mean_sd_sum_intden %>% ggplot(aes(x= metabolite, y=mean_sum_intden))+
+  geom_bar(aes(fill=metabolite), stat="identity", color="black", # colorは枠線の色
+           width = 0.8, position = position_dodge(width = 0.9)) + # widthでバーの幅を、position_dodge(width)でバー間の距離を規定
+  geom_signif(xmin = xmin1, xmax = xmax1, y_position = y_position1, annotations = annot1, tip_length = 0.00, textsize =  3) +
+  geom_errorbar(limits_sum_intden, width = 0.3, position = position_dodge(width=0.9))+
+  scale_fill_manual(values = c('#bdbdbd',"#F8766D", "#00BA38", "#00BFC4", "#619CFF", "#F564E3")) + # fillの色を指定
+  geom_jitter(sum_intden, mapping=aes(x=metabolite, y= sum_intden),size = 1.5,
+              alpha=0.7, width = 0.2, height = 0)+
+  ylab("Sum of integrated density\n of particles/image") +   ## y軸のラベル
+  xlab("")+                   ## x軸のラベル
+  # ylim(0,3.2e+06)+          ## y軸のレンジ
+  theme( axis.title.y = element_text(size=14), axis.text.y = element_text(size=14,color = "black"),
+         axis.title.x = element_text(size=14), axis.text.x = element_text(size=14,color = "black")
+         ,legend.position = "none" #凡例を消す
+         ,panel.border = element_rect(fill = NA, linewidth = 0.5) # パネルを枠で囲む
+         ,panel.background = element_blank()) #背景を白にする
+plot_si
+```
+
+***
+```{r}
+ annot2 = c("NS", "***", "***","***","***","***","NS","NS")
+  y_position2 = c(13200,12750,12300,11850,11400,10900,10600,10200)
+  xmin2 = c(1,1,1,1,1,3,4,4)
+  xmax2 = c(2,3,4,5,6,4,5,6)
+  
+plot_mm <- mean_sd_mean_mean %>% ggplot(aes(x= metabolite, y=mean_mean_mean))+
+  geom_bar(aes(fill=metabolite),stat="identity", color="black",width = 0.8, position = position_dodge(width = 0.9))+
+  geom_signif(xmin = xmin2, xmax = xmax2, y_position = y_position2, annotations = annot2, tip_length = 0.00, textsize =  3) +
+  scale_fill_manual(values = c('#bdbdbd',"#F8766D", "#00BA38", "#00BFC4", "#619CFF", "#F564E3"))+
+  geom_errorbar(limits_mean_mean, width = 0.3, position = position_dodge(width=0.9))+ 
+  geom_jitter(mean_mean, mapping=aes(x=metabolite, y= mean_mean),size = 1.5,
+              alpha=0.7, width = 0.2, height = 0)+
+  ylab("Mean density of particles/image") + # y軸のラベル
+  xlab("")+   # x軸のラベル
+  theme( axis.title.y = element_text(size=14), axis.text.y = element_text(size=14,color = "black"),
+         axis.title.x = element_text(size=14), axis.text.x = element_text(size=14,color = "black")
+         ,legend.position = "none" #凡例を消す
+         ,panel.border = element_rect(fill = NA, linewidth = 0.5)# パネルを枠で囲む
+         ,panel.background = element_blank())
+plot_mm
+```
+
+# グラフに注釈を付ける
+`annotate()`を使用してx軸の「SAMP」から「ATP」まで下線を引き、テキスト「500 µM」を追加する。  
+`coord_cartesian()`で`clip = "off"`とすることでプロットの外側に注釈を追加できる。
+
+```{r}
+plot_si +
+  # annotate()で下線とテキストを追加
+  annotate("segment", x = 1.5, xend = 6.5, y = -0.5e+06, yend = -0.5e+06, colour = "black", size = 0.7) +
+  annotate("text", x = 4, y = -0.65e+06, label = "500 µM", size = 5)+
+  coord_cartesian(ylim = c(0e+00, 4.2e+06), clip = "off")
+```
+
+```{r}
+plot_mm +
+  annotate("segment", x = 1.5, xend = 6.5, y = -1500, yend = -1500, colour = "black", size = 0.7) +
+  annotate("text", x = 4, y = -2000, label = "500 µM", size = 5)+
+  coord_cartesian(ylim = c(0, 13300), clip = "off")
+```
+

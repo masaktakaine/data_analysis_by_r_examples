@@ -1,0 +1,172 @@
+---
+title: "Ade4顆粒脱会合の経時観察"
+author: "MT"
+date: "2023-03-06"
+output:
+  html_document: 
+    number_section: yes
+    toc: yes
+    toc_float: yes
+    highlight: textmate
+    theme: lumen
+  word_document:
+    toc: yes
+    toc_depth: '3'
+  pdf_document:
+    toc: yes
+    toc_depth: '3'
+  always_allow_html: yes
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r klippy, echo=FALSE, include=TRUE}
+klippy::klippy(position = c('top', 'right'))  ## コードのコピーボタンを作成、PDFやWordでKnitする際はコメントアウトする
+```
+# この事例で扱うデータと統計
+**カテゴリ変数**：adenineの有無 `adenine`（"-adenine", "+adenine"）  
+**数値変数**： 観察時間（分）`frame`, 1細胞あたりの蛍光の極大点の個数 `count_per_cell`  
+**グラフ**：折れ線グラフ（平均値）+ 影（1SD）    
+**統計**：無し
+
+# データの取得と取り込み
+アデニン非存在下でAde4-mNG顆粒を形成している細胞に、アデニンを添加して、顆粒が消失する様子を経時観察。FIJI上での画像解析により書く時間における細胞内顆粒の数（緑蛍光の極大点）を計測し、csvファイルとして出力。4回分の実験データをまとめて解析。
+```{r}
+library(pacman)
+p_load(tidyverse, openxlsx, readxl, knitr)  # パッケージをまとめてロード
+```
+***
+```{r}
+# 各実験日データが入っているフォルダを指定, 4つのサブフォルダを含む
+import_file_path <- "raw_data"
+# データファイル名のリストを取得、recursive = Tでサブフォルダ内も検索する
+csv_list <- list.files(import_file_path, full.names = TRUE, recursive = TRUE, pattern = "*.csv") 
+```
+`spply()`を使い、ファイル名リストから全てのファイルを一括で読み込み、データフレームのリストを作成。さらに`bind_rows()`でデータフレームを縦に連結して１つにする。
+
+```{r}
+merge_df <- csv_list %>% 
+  sapply(., read.csv, header =TRUE, sep = ",", stringsAsFactors = F, simplify = F) %>%
+  bind_rows()
+```
+実験日の違いを示す変数`exp`を作っておく。
+```{r}
+merge_df <- merge_df %>% mutate(exp = case_when(
+  str_detect(date, "0306") ~ "exp1",
+  str_detect(date, "0307") ~ "exp2",
+  str_detect(date, "0308") ~ "exp3",
+  str_detect(date, "0309") ~ "exp4",
+  str_detect(date, "0301") ~ "exp5"))
+```
+ファイル名に重複があるので、`exp`と組み合わせて固有のファイル名にする。また変数名`X`を`frame`に変更
+```{r}
+merge_df <- merge_df %>% 
+  mutate(file = paste(file, exp, sep = "_"))
+merge_df <- merge_df %>% 
+  rename(frame = X)
+```
+adenineの有無を示す変数`adenine`を追加、2択なの`でif_else()`を使用。変数`file`中に文字列"mock"という文字列があれば、"-adenine"、それ以外なら"+adenine"。
+```{r}
+merge_df <- merge_df %>% 
+  mutate(adenine = if_else(
+    str_detect(file, "mock"), "- adenine", "+ adenine")) %>% # 
+  mutate(time = -3 + 2*(frame-1))　　# frameを時間に変換、2分間隔で撮影、t = 3 minでアデニンを添加 
+```
+***
+```{r}
+knitr::kable(merge_df[1:5, ], digits = 2)
+```
+
+***
+# データの集計
+視野内の解析した細胞の数`total_cell_num`の平均とSDを求める。結果をExcelファイルとして保存。
+```{r}
+total_cell_num_stat <- merge_df %>% 
+  group_by(file, adenine) %>% 
+  summarise(total_cell_num = mean(total_cell_num)) %>%
+  group_by(adenine) %>%
+  summarise(total_cell_num_mean = mean(total_cell_num), total_cell_num_sd = sd(total_cell_num),N=n())
+total_cell_num_stat %>% 
+  write.xlsx("total_cell_num_stat.xlsx", colNames = TRUE, sheetName = "230309_maxima_counts")
+```
+***
+1つの細胞あたりの極大点の数`count_per_cell`の平均値とSDを求める。
+```{r message=FALSE, warning=FALSE}
+mean_sd <- merge_df %>% 
+  group_by(adenine, prominence, time) %>% 
+  summarise(mean = mean(count_per_cell), sd = sd(count_per_cell),N=n())
+knitr::kable(mean_sd[1:5,], digits = 2)
+```
+***
+# データの可視化
+`count_per_cell`の平均値とSDを変数`prominence`毎にグラフ化。SDは陰影で表す。アデニン有り無しで別のグラフにする。
+```{r}
+# prominenceとfileをfactor型にしておく
+mean_sd$prominence <- as_factor(mean_sd$prominence)
+merge_df$file <- as_factor(merge_df$file)
+```
+```{r}
+meanplot <- mean_sd %>% 
+  ggplot(aes(x=time, y= mean)) +
+  # geom_ribbonである範囲の陰影を描く、fillで"grey70"のように直接色を指定することもできる
+  geom_ribbon(aes(ymin = mean - sd, ymax = mean + sd, fill = prominence), alpha = 0.4) + # 
+  geom_line(aes(colour = prominence)) +
+  xlab("Time (min)") +
+  ylab("Number of maxima/per cell/image") +
+  theme_bw() +
+  facet_grid(~ adenine)
+meanplot
+```
+
+***
+`prominence` = 100のデータに絞って解析。
+```{r}
+meanplot_prom100 <- mean_sd %>% 
+  filter(prominence == 100) %>% 
+  ggplot(aes(x=time, y= mean))+
+  geom_ribbon(aes(ymin=mean-sd, ymax=mean+sd, fill=adenine), alpha=0.4)+ # 
+  geom_line(aes(colour=adenine), linewidth = 1)+
+  geom_point()+
+  xlab("Time (min)") +
+  ylab("Number of maxima per cell/image")+
+  theme_bw()
+meanplot_prom100
+```
+
+`prominence` = 100かつ`+adenine`の個々のデータをプロット。
+```{r}
+merge_df %>% 
+  filter(adenine == "+ adenine" & prominence == 100) %>% 
+  ggplot(aes(x=time, y = count_per_cell, color= file))+
+  geom_line(linewidth = 1)
+```
+
+***
+論文用のグラフ作成。
+```{r message=FALSE, warning=FALSE}
+meanplot_prom100 <- mean_sd %>%
+  filter(prominence == 100) %>% 
+  ggplot(aes(x=time, y= mean)) +
+  # geom_ribbonである範囲の陰影を描く、fillで"grey70"のように直接色を指定することもできる
+  geom_ribbon(aes(ymin=mean-sd, ymax=mean+sd, fill=adenine), alpha=0.5) +
+  geom_line(aes(color = adenine),linewidth = 1) +
+  geom_point()+
+  scale_x_continuous(breaks = seq(0,60, by = 10)) +
+  xlim(-3, 17)+
+  xlab("Time (min)") +
+  ylab("Number of maxima per cell")+
+  guides(fill = guide_legend(title = NULL))+  #凡例のタイトルを非表示
+  guides(color = guide_legend(title = NULL))+ #凡例のタイトルを非表示
+  scale_fill_manual(values = c("#0068b7","#f39800"), labels = c(`+ adenine`= "−ade → +ade", `- adenine`= "−ade → −ade"))+
+  scale_color_manual(values = c("#0068b7","#f39800"), labels = c(`+ adenine`= "−ade → +ade", `- adenine`= "−ade → −ade"))+
+  theme( axis.title.y = element_text(size=14), axis.text.y = element_text(size=14,color = "black"),
+         axis.title.x = element_text(size=14), axis.text.x = element_text(size=14,color = "black"),
+         legend.text = element_text(size = 12) # 凡例のラベルの体裁
+         ,legend.position = "bottom"
+         ,panel.border = element_rect(fill = NA, size = 0.5)# パネルを枠で囲む
+         ,panel.background = element_blank())  # 背景を白にする
+meanplot_prom100
+```
+

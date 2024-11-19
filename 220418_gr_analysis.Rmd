@@ -1,0 +1,328 @@
+---
+title: "ADE4とade4∆IDR株の生育曲線の解析"
+author: "MT"
+date: "2022-04-18"
+output:
+  html_document: 
+    number_section: yes
+    toc: yes
+    toc_float: yes
+    highlight: textmate
+    theme: lumen
+  word_document:
+    toc: yes
+    toc_depth: '3'
+  pdf_document:
+    toc: yes
+    toc_depth: '3'
+  always_allow_html: yes
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r klippy, echo=FALSE, include=TRUE}
+klippy::klippy(position = c('top', 'right'))  ## コードのコピーボタンを作成、PDFやWordでKnitする際はコメントアウトする
+```
+# この事例で扱うデータと統計
+**カテゴリ変数**：遺伝型`strain` (Ade4, Ade4∆IDR)、窒素源 `nitrogen` ("38 mM AS", 1 mM AS, 8 mM proline)、アデニンの有無 `adenine`（adenine(-), adenine(+)）、反復を表す`replicate`   
+**数値変数**： 時間 `hours`, 光学密度 `OD`  
+**グラフ**：折れ線グラフ（平均値）+ 影（1SD）、棒グラフ+エラーバー（1SD）+各データポイント    
+**統計**：無し
+
+# データの取り込みと変換
+培養液の600 nmにおける光学密度を経時的に測定することで、細胞の増殖をモニター。測定結果はExcelファイルにまとめる。
+```{r}
+library(pacman)
+p_load(tidyverse, openxlsx, ggsignif, readxl, knitr, nparcomp, rstatix)  # パッケージをまとめてロード
+```
+***
+Excelファイルの読み込み。秒単位の時間`second`の列以外は、各サンプルのODの値が各列に相当する、ワイド形式のデータセット。
+```{r}
+tldata <- read_excel("220417_tl.xlsx", 
+                         sheet = "blank_corrected")
+head(tldata)
+```
+
+変数`second`の値から文字列`(s)`を除き、数値型に変換。データ全体をロング形式にする。
+```{r}
+# secondから"(s)"を除く、「(」はメタ文字なのでエスケープ、さらに数値型に変換
+tldata <- tldata %>% 
+  mutate(second  = as.double(str_remove(second, "\\(s\\)"))) %>%
+  # データを縦型にする
+  pivot_longer(-second, names_to = "ID", values_to = "OD")
+head(tldata)
+```
+
+***
+変数`ID`の値の文字列を解析することで、変数`strain`, `nitrogen`, `adenine`を作成。また`second`から変数`hours`を作成。余分な行も除いておく。
+```{r}
+# 変数strainを追加する
+tldata <- tldata %>%
+  mutate(strain = case_when(
+               str_detect(ID, "w") ~ "Ade4",
+               str_detect(ID, "m") ~ "Ade4∆IDR",
+               TRUE ~ "blank"
+             ),
+# 変数nitrogenを追加 
+         nitrogen = case_when(
+               str_detect(ID, "h") ~ "38 mM AS",
+               str_detect(ID, "l") ~ "1 mM AS",
+               str_detect(ID, "p") ~ "8 mM proline"
+         ),
+# 変数adenineを追加
+        adenine = case_when(
+              str_detect(ID, "a") ~ "adenine(+)",
+              TRUE ~ "adenine(-)"
+        ),
+# 変数hoursを追加
+        hours = second / 3600) %>% 
+# blankの行は消去
+  filter(strain != "blank")
+```
+
+***
+IDの最後の数字を変数`replicate`に格納。また`nitrogen`のレベル順を規定しておく。
+```{r}
+tldata <- tldata %>% 
+  mutate(replicate = str_sub(ID, -1, -1))
+levels(tldata$nitrogen)
+tldata$nitrogen <- fct_relevel(tldata$nitrogen, c("38 mM AS","1 mM AS","8 mM proline"))
+tldata
+```
+
+***
+ODの値を最大値で正規化するため、40時間までの最大値`max`を計算してデータフレーム`max_40h`に格納。`left_join()`で`tldata`に`max`を組み合わせる。さらに`OD`を`max`で割り算して変数`nOD`を計算。
+```{r}
+# 40時間までの最大値を計算して変数maxに格納
+max_40h <- tldata %>% 
+  group_by(strain, nitrogen, adenine, replicate) %>% 
+  filter(hours < 40) %>% summarise(max = max(OD))
+
+tldata <- left_join(tldata, max_40h) %>%
+  mutate(nOD = OD / max)
+tldata
+```
+
+***
+# 生育曲線の描画
+全体の生データの傾向をプロットして観察。
+```{r}
+tldata %>% 
+  ggplot(aes(x = hours, y = OD, color = strain)) +
+  geom_point(size = 0.2) +
+  facet_grid(adenine ~ nitrogen)
+#  nODの場合
+tldata %>% 
+  ggplot(aes(x = hours, y = nOD, color = strain)) +
+  geom_point(size = 0.2) +
+  facet_grid(adenine ~ nitrogen)
+```
+
+***
+`replicate`で平均化したgrowth curveを描く。
+```{r}
+# 平均値とSDの計算
+mean_sd <- tldata %>% 
+  group_by(hours,strain, nitrogen, adenine) %>% 
+  summarise(mean = mean(nOD), sd = sd(nOD))
+
+meanplot <- mean_sd %>% ggplot(aes(x=hours, y= mean)) +
+  # geom_ribbonである範囲の陰影を描く、fillで"grey70"のように直接色を指定することもできる
+  geom_ribbon(aes(ymin=mean-sd, ymax=mean+sd,fill=strain), alpha=0.4) + 
+  geom_line(aes(colour=strain))+
+  xlab("Time (h)") +
+  ylab("normalized OD595")+
+  xlim(0 ,40)+
+  theme_bw()+
+  facet_grid(adenine ~ nitrogen)
+
+meanplot +
+  theme(legend.position = c(0.95,0.05), legend.justification =c(1,0))
+# legend.positionで凡例の位置を変える、グラフ内に入れる場合は座標位置を指定、左下がc(0,0)で右上がc(1,1)
+# 凡例ボックスのどの位置をlegend.positionに配置するかはlegend.justificationで指定する
+```
+
+***
+`adenine`の値で別々にプロット。
+```{r message=FALSE, warning=FALSE}
+# adenine(-)の場合
+meanplot_woade <- mean_sd %>% 
+  filter(adenine == "adenine(-)") %>% ggplot(aes(x=hours, y= mean)) +
+  geom_ribbon(aes(ymin=mean-sd, ymax=mean+sd,fill=strain), alpha=0.4)+ # 
+  geom_line(aes(colour=strain))+
+  scale_fill_manual(values = c("#0068b7","#f39800")) +  # fillの色を直接指定
+  scale_color_manual(values = c("#0068b7","#f39800")) + # color（線）の色を直接指定
+  xlab("Time (h)") +
+  ylab("normalized OD595")+
+  xlim(0 ,40)+
+  theme_bw()+
+  facet_grid(adenine~ nitrogen)
+meanplot_woade
+```
+
+***
+```{r message=FALSE, warning=FALSE}
+meanplot_wade <- mean_sd %>% 
+  filter(adenine == "adenine(+)") %>% ggplot(aes(x=hours, y= mean)) +
+  geom_ribbon(aes(ymin=mean-sd, ymax=mean+sd,fill=strain), alpha=0.4)+ # 
+  geom_line(aes(colour=strain))+
+  scale_fill_manual(values = c("#0068b7","#f39800")) +  # fillの色を直接指定
+  scale_color_manual(values = c("#0068b7","#f39800")) + # color（線）の色を直接指定
+  xlab("Time (h)") +
+  ylab("normalized OD595")+
+  xlim(0 ,40)+
+  theme_bw()+
+  facet_grid(adenine~ nitrogen)
+meanplot_wade
+```
+
+***
+# データの定量的解析
+各条件における生育曲線の違いを定量的に解析するため、増殖が最大値の半分になる時間`halfmaxtime`を導入する。`nOD`が0.5以下の、`hours`の最大値が`halfmaxtime`に相当する。
+```{r message=FALSE, warning=FALSE}
+# nODが0.5になる時間を求める
+halfmaxtime <- tldata %>% 
+  group_by(strain, nitrogen, adenine, replicate) %>% 
+  filter(nOD <= 0.5) %>%
+  summarise(halfmaxtime = max(hours))
+```
+
+`halfmaxtime`の平均とSDを計算。
+```{r message=FALSE, warning=FALSE}
+mean_halfmaxtime <- halfmaxtime %>% 
+  group_by(strain, nitrogen, adenine) %>% 
+  summarise(mean_ht = mean(halfmaxtime), sd_ht = sd(halfmaxtime))
+```
+
+`halfmaxtime`の平均値とSD、および各データポイントをプロット。さしあたってWelch t-testで両側検定したp値も描画。
+```{r}
+mean_halfmaxtime %>% ggplot(aes(x = strain, y = mean_ht)) +
+  geom_col(data = mean_halfmaxtime,color="black", fill = "snow3", width = 0.5)+
+  geom_errorbar(aes(ymin = mean_ht - sd_ht, ymax = mean_ht + sd_ht, width = 0.2))+
+  geom_jitter(halfmaxtime, mapping=aes(x=strain, y= halfmaxtime, color=strain),
+              size = 2, alpha=0.8, height = 0, width = 0.1) +
+  # height = 0にしないとy軸上に散らばり不正確になる
+  # map_signif_levelはdefaultでFALSEであり、p値そのものが表示される
+  geom_signif(data=halfmaxtime,mapping=aes(x=strain,y=halfmaxtime),
+              comparisons = list(c("Ade4","Ade4∆IDR")),
+               test.args= list(alternative = "two.sided", var.equal = FALSE, paired=F),
+              test = "t.test", map_signif_level = FALSE, step_increase = 0, y_position = 22)+
+  ylab("Half-maximum time (hours)") +
+  xlab(NULL) +
+  theme( axis.title.y = element_text(size=14), axis.text.y = element_text(size=14,color = "black"),
+         axis.text.x = element_text(size=14,color = "black")
+         ,legend.position = "none" #凡例を消す
+         ,panel.border = element_rect(fill = NA, linewidth = 0.5)
+         ,panel.background = element_blank())+ 
+  facet_grid(adenine ~ nitrogen)
+```
+
+***
+# データの正規性の検証
+`halfmaxtime`の分布が正規分布に従っているかどうか、Shapiro-Wilk検定で検証。各カテゴリ変数の組み合わせを表すデータフレームを作り、それを引数として`shapiro_test()`を実行。
+```{r}
+# 組み合わせ combを作成
+strains <- c("Ade4", "Ade4∆IDR")
+nitros <- levels(halfmaxtime$nitrogen)
+ades <- c("adenine(-)", "adenine(+)")
+
+comb <- expand.grid(strains, nitros, ades) %>%  
+  rename(strain = Var1, nitro = Var2, ade = Var3) %>% 
+  mutate(combination = paste(strain, nitro, ade, sep = "_"))
+comb
+
+# データフレームを入力としてshapiro_test()を実行する自作関数を作成
+swt <- function(df){halfmaxtime %>%  
+    filter(strain == df[["strain"]] & nitrogen == df[["nitro"]] & adenine == df[["ade"]]) %>% 
+    ungroup() %>% 
+    dplyr::select(halfmaxtime) %>%
+    as_vector() %>% # ベクトル型に直す
+    shapiro_test()}
+
+# データフレームcombの、各行ごとに関数を適用
+res_swt <- apply(comb, 1, swt)
+names(res_swt) <- comb$combination  # リストの要素と組み合わせを対応付ける
+res_swt
+```
+
+***
+p<0.05となるのはAde4_8mM proline_-ade: p = 0.02, Ade4_38mM AS_+ade: p = 0.03, Ade4_1mM AS_ade+: p = 0.0328, Ade4_8mM proline_ade+: p = 0.04。いずれもかなり p = 0.05に近く、比較する両方でp<0.05になるケースは無い。またMann-Whitney testを行うと、「タイがあるため正確なp値を計算できない」と6ケース全てで警告が出る。総合的に考えて、正規性があるとして良いか。
+
+***
+改めてWelch検定でp値を確認。
+```{r}
+halfmaxtime %>% 
+  filter(nitrogen == "38 mM AS", adenine == "adenine(-)") %>% 
+  t.test(halfmaxtime ~ strain, data =.,  ## data=. としないとエラー
+                      alternative = "two.sided", paired = FALSE, var.equal = FALSE)
+```
+
+***
+論文用グラフの作成。
+```{r message=FALSE, warning=FALSE}
+# adenine(-)のデータ
+mean_halfmaxtime_woade2 <- mean_halfmaxtime %>% 
+  filter(adenine == "adenine(-)") %>% 
+  ggplot(aes(x = strain, y = mean_ht, fill=strain)) +
+  geom_col(color="black", width = 0.7) +
+  geom_errorbar(aes(ymin = mean_ht - sd_ht, ymax = mean_ht + sd_ht, width = 0.3)) +
+  geom_jitter(halfmaxtime[halfmaxtime$adenine == "adenine(-)",],
+              mapping=aes(x=strain, y= halfmaxtime), color="black", 
+              size = 1.5, alpha=0.8, 
+              height = 0, width = 0.3) + # height = 0にしないとy軸上に散らばり不正確になる
+ 
+  geom_signif(data=halfmaxtime[halfmaxtime$adenine == "adenine(-)",], 
+              mapping=aes(x=strain,y=halfmaxtime),
+              comparisons = list(c("Ade4","Ade4∆IDR")),
+              test = "t.test",map_signif_level = FALSE, step_increase = 0, y_position = 23, textsize = 4,
+              test.args= list(alternative = "two.sided", var.equal = FALSE, paired=F)) +
+
+  scale_fill_manual(values = c("#0068b7","#f39800"))+
+  ylab("Half-maximum time (hours)") +
+  xlab(NULL)+
+  ylim(0,25)+
+  theme( axis.title.y = element_text(size=12), axis.text.y = element_text(size=12,color = "black"),
+         axis.text.x = element_text(size=12,color = "black"),
+         strip.text = element_text(size = 12)
+         ,legend.position = "bottom"
+         ,panel.border = element_rect(fill = NA, linewidth = 0.5)
+         ,panel.background = element_blank()) +
+  facet_grid(adenine ~ nitrogen)
+mean_halfmaxtime_woade2
+```
+
+```{r message=FALSE, warning=FALSE}
+# adenine(+)のデータ
+mean_halfmaxtime_wade2 <- mean_halfmaxtime %>% 
+  filter(adenine == "adenine(+)") %>% 
+  ggplot(aes(x = strain, y = mean_ht, fill=strain)) +
+  geom_col(color="black", width = 0.7) +
+  geom_errorbar(aes(ymin = mean_ht - sd_ht, ymax = mean_ht + sd_ht, width = 0.3)) +
+  geom_jitter(halfmaxtime[halfmaxtime$adenine == "adenine(+)",],
+              mapping=aes(x=strain, y= halfmaxtime), color="black", 
+              size = 1.5, alpha=0.8, 
+              height = 0, width = 0.3) + # height = 0にしないとy軸上に散らばり不正確になる
+ 
+  geom_signif(data=halfmaxtime[halfmaxtime$adenine == "adenine(+)",], 
+              mapping=aes(x=strain,y=halfmaxtime),
+              comparisons = list(c("Ade4","Ade4∆IDR")),
+              test = "t.test",map_signif_level = FALSE, step_increase = 0, y_position = 23, textsize = 4,
+              test.args= list(alternative = "two.sided", var.equal = FALSE, paired=F)) +
+
+  scale_fill_manual(values = c("#0068b7","#f39800"))+
+  ylab("Half-maximum time (hours)") +
+  xlab(NULL)+
+  ylim(0,25)+
+  theme( axis.title.y = element_text(size=12), axis.text.y = element_text(size=12,color = "black"),
+         axis.text.x = element_text(size=12,color = "black"),
+         strip.text = element_text(size = 12)
+          ,legend.position = "bottom"
+         ,panel.border = element_rect(fill = NA, linewidth  = 0.5)
+         ,panel.background = element_blank()) +
+  facet_grid(adenine ~ nitrogen)
+mean_halfmaxtime_wade2
+```
+
+

@@ -1,0 +1,130 @@
+---
+title: "出芽酵母Ade4の細胞内濃度の推定"
+author: "MT"
+date: "2022-10-25"
+output:
+  html_document:
+    df_print: paged
+    number_section: yes
+    toc: yes
+    toc_float: yes
+    toc_depth: 3
+  word_document:
+    toc: yes
+    toc_depth: '3'
+  pdf_document:
+    toc: yes
+    toc_depth: '3'
+  always_allow_html: yes
+---
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r klippy, echo=FALSE}
+klippy::klippy(position = c('top', 'right'))  ## コードのコピーボタンを作成、PDFやWordでKnitする際はコメントアウトする
+```
+***
+# データ取得  
+既報のデータを利用して出芽酵母Ade4の細胞内濃度を推定する。酵母ではゲノムワイドなプロテオミクス解析により、細胞内タンパク質の分子数を網羅的に測定する研究がいくつもなされている。[SGDのAde4のページ](https://www.yeastgenome.org/locus/S000004915/protein)に、それらの先行研究から得られたAde4の推定細胞内分子数のデータがまとめられている、中段の*ADE4.abundance_data.txt*をダウンロードして保存
+
+```{r message=FALSE}
+library(pacman)
+p_load(tidyverse, ggsignif, readxl, openxlsx, readr)
+ADE4_abundance_data <- read_delim("ADE4_abundance_data.txt",
+                                  delim = "\t", escape_double = FALSE,  # 区切り文字はtab
+                                  comment = "!",   # ファイル中の!はコメント扱いで読み込まれない
+                                  trim_ws = TRUE)  # 空白を無視する
+head(ADE4_abundance_data)
+```
+
+また出芽酵母の細胞質の容積は42±2 flと推定されている ([bionumber id 100427](https://bionumbers.hms.harvard.edu/bionumber.aspx?id=100427)) 
+
+***
+# データの変換  
+主なデータの区分  
+**Abundance (molecules/cell)**：推定細胞内分子数  
+**Media**：培地の組成、YPD系の富栄養培地か最小合成培地か  
+**Visualization**： 測定手法のこと、質量分析、フローサイトメトリー、定量的蛍光顕微鏡、ウエスタンブロッティングなど  
+**Treatment**：細胞の処理条件、何らかのストレスを受けているか否か
+```{r}
+# 細胞内濃度concを追加、細胞質の容積を42flと仮定する、単位はµM
+ADE4_abundance_data <- ADE4_abundance_data %>% 
+  mutate(conc = `Abundance (molecules/cell)`*0.01/(42*6.02))
+
+# 測定法、methodを追加
+ADE4_abundance_data <- 
+  ADE4_abundance_data %>% 
+  mutate(method = case_when(
+    str_detect(Visualization, "microscopy") ~ "fluo. microscopy",
+    str_detect(Visualization, "cytometry") ~ "cytometry",
+    str_detect(Visualization, "spectro") ~ "mass spec",
+    str_detect(Visualization, "blotting") ~ "immunoblot"
+  ))
+
+# 培地mediumを追加、richとsyntheticの２つに分ける
+ADE4_abundance_data <- 
+  ADE4_abundance_data %>% 
+  mutate(medium = case_when(
+    str_detect(Media, "Y") ~ "rich",
+    TRUE ~ "synthetic"))
+
+# ストレスを受けているかどうかを示すstressを追加
+ADE4_abundance_data <- 
+  ADE4_abundance_data %>% 
+  mutate(stress = case_when(
+    str_detect(Treatment, "untreated") ~ "unstressed",
+    TRUE ~ "stressed"))
+```
+余計な変数を除いて、表形式で表示して確認。
+```{r}
+ADE4_abundance_data <- ADE4_abundance_data %>% 
+  select(conc:stress, `Original Reference`)
+ADE4_abundance_data$stress <- as.factor(ADE4_abundance_data$stress) # factor型へ変換
+# fct_relevelでレベル順を変更
+ADE4_abundance_data$stress <- fct_relevel(ADE4_abundance_data$stress, c("unstressed", "stressed"))
+knitr::kable(ADE4_abundance_data)
+```
+
+***
+平均値やSDを計算
+```{r}
+mean_sd_conc <- 
+  ADE4_abundance_data %>% group_by(medium, stress, method) %>% 
+  summarise(
+    mean_conc = mean(conc),
+    sd_conc = sd(conc),
+    N = n())
+## 1ｘSDに相当するerror barを書くための範囲を設定
+limits_conc <- aes(ymax = mean_conc + sd_conc, ymin = mean_conc - sd_conc)
+# openxlsxのwrite.xlsxでexcelファイルとしてエクスポート、シート名も指定できる（ハイフン"-"は使用できないので注意） 
+mean_sd_conc %>% write.xlsx(., file = "mean_sd_conc.xlsx", colNames = T) 
+knitr::kable(mean_sd_conc)
+```
+
+***
+# データの可視化  
+各項目にグループ分けして、細胞内濃度の各データ点と平均値を描画。
+```{r message=FALSE, warning=FALSE}
+plot_conc <- mean_sd_conc %>%
+  ggplot(aes(x= medium, y=mean_conc))+
+  ## colorは枠線の色, widthでバーの幅を、position_dodge(width)でバー間の距離を規定
+  geom_bar(stat="identity", color="black", fill ="grey60", width = 0.7, position = position_dodge(width = 0.8))+  
+  geom_errorbar(limits_conc, width = 0.2, position = position_dodge(width=0.8))+ 
+  geom_jitter(ADE4_abundance_data, mapping=aes(x=medium, y= conc, color = `Original Reference`),size = 2,
+              alpha=1, width = 0.15, height = 0)+
+  ylab("Intracellular conc. (µM)") +   ## y軸のラベル
+  xlab("Medium")+                   ## x軸のラベル
+  theme( axis.title.y = element_text(size=12), axis.text.y = element_text(size=12,color = "black"),
+         axis.title.x = element_text(size=12), axis.text.x = element_text(size=12,color = "black")
+         #,legend.position = "none" #凡例を消す
+         ,panel.border = element_rect(fill = NA, size = 0.5)  # パネルを枠で囲む
+         ,panel.background = element_blank()) +  #背景を白にする
+facet_wrap(stress ~ method)
+plot_conc
+```
+
+***
+# 結果と考察  
+* 全ての条件においてAde4の細胞内濃度は0.5 µM前後に収まっていた、これは*in vitro condensation assay*においてサブマイクロモーラーのタンパク質濃度で実験することの理由付けになるだろう。
+

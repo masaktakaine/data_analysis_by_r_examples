@@ -1,0 +1,290 @@
+---
+title: "ade12変異株におけるAde4顆粒形成の観察"
+author: "MT"
+date: "2023-03-15"
+output:
+  html_document: 
+    number_section: yes
+    toc: yes
+    toc_float: yes
+    highlight: textmate
+    theme: lumen
+  word_document:
+    toc: yes
+    toc_depth: '3'
+  pdf_document:
+    toc: yes
+    toc_depth: '3'
+  always_allow_html: yes
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r klippy, echo=FALSE, include=TRUE}
+klippy::klippy(position = c('top', 'right'))  ## コードのコピーボタンを作成、PDFやWordでKnitする際はコメントアウトする
+
+# install.packages("remotes")
+# remotes::install_github("rlesur/klippy")
+```
+---
+# この事例で扱うデータと統計
+**カテゴリ変数**：`strain`（wt, ade12∆）, `condition`（mock, +adenine, +hypoxanthine）  
+**数値変数**： 顆粒を持つ細胞の割合（%）:`pct_foci_cell`  
+**グラフ**：棒グラフ（平均） + エラーバー（1SD） + ドットプロット（各データポイント）  
+**統計**：Shapiro-Wilk検定による正規性の検証、Kruskal-Wallis検定によるノンパラメトリックな1元配置分散分析、Steelの多重検定（ノンパラメトリック） 
+
+# データの取得と読み込み
+Ade12の遺伝子破壊株におけるAde4顆粒形成を観察、野生株と顆粒形成効率を比較する。蛍光顕微鏡観察後、画像処理により顆粒を持つ細胞の割合を計測し、csvファイルで出力。
+
+```{r}
+library(pacman)
+# パッケージをまとめてロード
+p_load(tidyverse, openxlsx, readxl, ggtext, multcomp, ggsignif, knitr, nparcomp, rstatix, dunn.test)
+```
+
+3/15, 3/16, 3/17のfoci_stat.csvが入っているフォルダを指定。
+```{r}
+import_file_path <- "foci_stat_file" 
+csv_list<- list.files(import_file_path, full.names = T, recursive = T, pattern = "*.csv")
+```
+`spply()`を使い、ファイル名リストから全てのファイルを一括で読み込み、データフレームのリストを作成。さらに`bind_rows()`でデータフレームを縦に連結して１つにする。
+```{r}
+foci_stat <- csv_list %>%
+  sapply(., read.csv, header =T, sep = ",", stringsAsFactors = F, simplify = F) %>%
+  bind_rows()
+```
+
+実験日の違いを示す変数`exp`を作っておく。file名に重複があるので、expと組み合わせて固有のfile名にする。
+```{r}
+foci_stat <- foci_stat %>% mutate(exp = case_when(
+  str_detect(date, "0315") ~ "exp1",
+  str_detect(date, "0316") ~ "exp2",
+  str_detect(date, "0317") ~ "exp3"))
+foci_stat <- foci_stat %>% mutate(id = paste(file_name,exp, sep = "_"))
+```
+
+使用した細胞の遺伝型を示す、変数`strain`を作る。`str_detect()`は`tidyverse`群の中の`stringr`パッケージ中の関数、指定したベクトル中から正規表現で一致するものをTRUE/FALSEで返す
+```{r}
+foci_stat <-       
+  foci_stat %>%
+  mutate(strain =case_when(
+# ID中に"wt"が含まれていればTRUE, case_whenで条件を並列に書ける
+    str_detect(id, "wt") ~ "wt",            
+    str_detect(id, "ade12") ~ "ade12∆"))
+```
+
+同様に処理条件を表す変数`condition`を作る。
+```{r}
+foci_stat <-       
+  foci_stat %>% 
+  mutate(condition =case_when(　　　　　　　　　　
+    str_detect(id, "scade") ~ "+adenine", 
+    str_detect(id, "schyp") ~ "+hypoxanthine",
+    str_detect(id, "sc") ~ "mock")
+  )
+```
+
+`condition`と`strain`をfactor型にして、レベル順を規定する
+```{r}
+foci_stat$condition <- factor(foci_stat$condition, levels=c("mock","+adenine","+hypoxanthine")) 
+foci_stat$strain <- factor(foci_stat$strain, levels = c("wt", "ade12∆"))
+foci_stat <- as_tibble(foci_stat)
+foci_stat
+```
+
+# データの集計
+視野内で顆粒を持つ細胞の割合（%）を表す変数`pct_foci_cell`の平均とSDを求める。また1ｘSDに相当するerror barを書くための範囲を設定。結果をExcelファイルとして保存。
+```{r message=FALSE, warning=FALSE}
+# strainとconditionでグループ分けしてfociを持つ細胞の割合（pct_foci_cell）の平均とSDを計算
+mean_sd <-
+  foci_stat %>%
+  group_by(strain, condition) %>%　　
+  summarise(
+    mean_pct = mean(pct_foci_cell),
+    sd_pct = sd(pct_foci_cell), N=n())
+# Define the top and bottom of the errorbars
+limits <- aes(ymax = mean_pct + sd_pct, ymin = mean_pct - sd_pct)
+
+mean_sd %>% write.xlsx("230315-17_ade12_mean_sd.xlsx", colNames = T, sheetName = "230315")
+```
+
+# 正規性の検証
+データが正規分布に従っているかどうか、Shapiro-Wilk検定でデータの正規性を検証する。
+```{r}
+# strainとconditionの種類をベクトルとして取り出しておく
+strains <- levels(foci_stat$strain) 
+conditions <- levels(foci_stat$condition)
+
+# あるstrainの値に対応するpct_foci_cellの値の分布をshapiro.test()で検定するための関数を作成
+swt <- function(astrain, cond) {foci_stat %>%  
+  filter(strain == astrain & condition == cond) %>% 
+  dplyr::select(pct_foci_cell) %>%  
+  as_vector() %>% 
+  shapiro.test()}
+swt("wt", "mock") # 関数のテスト
+```
+`strain`と`condition`の組み合わせを`expand.grid()`で求め、データフレーム`comb`として出力。名前の組も変数`combination`として作成しておく。
+```{r}
+comb <- expand.grid(strains, conditions) %>% 
+  rename(strain = Var1, condition = Var2) %>% 
+  mutate(combination = paste(strain, condition, sep = "_"))
+comb
+```
+
+データフレームを入力としてShapiro-Wilk検定を行う関数`swt2`を作成、組み合わせ全体に対して検定を行い、結果をリストに格納。
+```{r}
+swt2 <- function(df) {foci_stat %>%  
+  filter(strain == df[["strain"]] &  # strainを指定
+        condition == df[["condition"]]) %>%  # conditionを指定
+    # group_by()でグループ化している場合は解除してselect()
+    # ungroup() %>% 
+  dplyr::select(pct_foci_cell) %>%
+  as_vector() %>% # ベクトル型に直す
+  shapiro_test()}
+
+res_swt <- apply(comb, 1, swt2)  # データフレームcombの各行ごとに関数を適用
+names(res_swt) <- comb$combination  # リストの要素と組み合わせを対応付ける
+
+sink("res_swt.txt") # res_swtをテキストファイルに保存
+res_swt
+sink()
+```
+ほぼ全ての組み合わせでp<0.05なので、データが正規分布に従っているとは言えない。従って、ノンパラメトリックな手法で解析する。`strain`と`condition`の2つのカテゴリ変数があるため、2つの1元配置分散分析と捉えるか、2元配置分散分析と捉えるかで検定手法が変わる。
+
+***  
+
+組み合わせの計算の別法。`dplyr::expand_grid()`を使うと、オブジェクト名がそのまま変数名になるので名前を付け直す必要が無い。
+```{r}
+comb2 <- 
+  expand_grid(strains, conditions) %>% 
+  mutate(combination = paste(strains, conditions, sep = "_"))
+comb2
+```
+
+関数をデータフレーム入力用に変更せず、`swt()`をそのまま使う方法。`map2`で2つの変数`strains`, `conditions`を`swt`に入力、結果を変数`swt_res`に格納。
+```{r}
+comb2 <- 
+  comb2 %>% 
+  mutate(swt_res = map2(strains, conditions, swt))
+```
+さらに`swt_res`からp値だけを抽出する。`rowwise()`にすることで、リストである`swt_res`の要素を指定できる。
+```{r}
+comb2 <- 
+comb2 %>% 
+  rowwise() %>% 
+  mutate(pval = swt_res$p.value)
+comb2
+```
+
+***
+## 1元配置分散分析と捉える場合
+`strain`を`pct_foci_cell`に影響を与えるカテゴリ変数とせずに、`condition`だけをカテゴリ変数とすれば、ノンパラメトリックな1元配置分散分析になり、Kruskal-Wallis検定が利用できる。
+```{r}
+aov_kw_wt <- foci_stat %>% 
+  filter(strain == "wt") %>%  # wtのデータを抽出
+  kruskal_test(pct_foci_cell ~ condition)
+# aov_kw_wt  # p<0.05よりグループ間に違いがあることを示唆
+
+aov_kw_ade12 <- foci_stat %>% 
+  filter(strain == "ade12∆") %>%  # ade12∆のデータを抽出
+  kruskal_test(pct_foci_cell ~ condition)
+# aov_kw_ade12  # p<0.05よりグループ間に違いがあることを示唆
+
+sink("res_aov_kw.txt")  # 結果を保存
+aov_kw_wt
+aov_kw_ade12
+sink()
+```
+
+***
+（参考）線形モデルを仮定した1元配置分散分析
+```{r}
+lm_model_wt <- foci_stat %>% 
+  filter(strain == "wt") %>% 
+  lm(pct_foci_cell ~ condition, data = .)
+# autoplot(lm_model_wt, smooth.colour = NA)
+anova(lm_model_wt)
+summary(lm_model_wt)
+
+lm_model_ade12 <- foci_stat %>% 
+  filter(strain == "ade12∆") %>% 
+  lm(pct_foci_cell ~ condition, data = .)
+# autoplot(lm_model_ade12, smooth.colour = NA)
+anova(lm_model_ade12)
+summary(lm_model_ade12)
+```
+
+***
+Dunnett法のノンパラメトリック版としてSteel testで多重比較する。nparcompパッケージのnparcomp()を使用。ここで得られたp値をグラフにアノテーションする。
+```{r}
+res_st_wt <- foci_stat %>% 
+  filter(strain == "wt") %>% 
+  nparcomp(pct_foci_cell ~ condition, data = .,
+            asy.method = "mult.t", type = "Dunnett",
+    # Dunnettの場合はcontrolで基準となるグループを指定
+           control = "mock", alternative = "two.sided", info = FALSE)
+
+res_st_ade12 <- foci_stat %>% 
+  filter(strain == "ade12∆") %>% 
+  nparcomp(pct_foci_cell ~ condition, data = .,
+            asy.method = "mult.t", type = "Dunnett",
+           control = "mock", alternative = "two.sided", info = FALSE)
+
+sink("res_steel_test_wt.txt")
+summary(res_st_wt)
+sink()
+sink("res_steel_test_ade12.txt")
+summary(res_st_ade12)
+sink()
+```
+
+## 2元配置分散分析と捉える場合
+前述のKruskal-Wallis検定は1元配置分散分析用であり、2元配置分散分析には適用できない。一般的にノンパラメトリックな2元配置分散分析を直接解析する手法は無い。`foci_stat`の平均値を取った`mean_sd`ならばFriedman検定が適用できる。p>0.05となり`pct_foci_cell`の値は`condition`や`strain`の種類に依存しないという帰無仮説は棄却されない。
+```{r}
+res_fried <- mean_sd %>% friedman.test(data=., mean_pct ~ condition | strain)
+res_fried
+```
+
+***
+（参考）線形モデルを仮定した2元配置分散分析
+```{r}
+model_ade12 <- foci_stat %>% lm(pct_foci_cell ~ strain * condition, data=.)
+# ggplot2::autoplot(model_ade12, smooth.colour =NA)
+anova(model_ade12)
+summary(model_ade12)
+```
+
+***
+# データの可視化
+顆粒を持つ細胞の割合の平均値を棒グラフで、1SDをエラーバーで描画。個々のデータ点もプロット。検定の結果も表示。
+```{r message=FALSE, warning=FALSE}
+# p値を手動でアノテーションするために必要なオブジェクト
+annot1 = c("***", "***", "***", "NS")
+y_position = c(99,92,99,92)
+xmin = c(0.7, 0.7, 1.7,1.7)
+xmax = c(1, 1.3, 2,2.3)
+
+plot1 <- mean_sd %>% 
+  ggplot(aes(x= strain, y=mean_pct, fill=condition))+
+  geom_bar(stat="identity", color="black", width = 0.8, position = position_dodge(width = 0.9))+  
+  geom_errorbar(limits, width = 0.5, position = position_dodge(width=0.9))+ 
+  geom_jitter(foci_stat, mapping=aes(x=strain, y= pct_foci_cell),size = 1,
+              alpha=0.8, position = position_jitterdodge(jitter.width = 0.1, jitter.height = 0, dodge.width = .9))+
+  geom_signif(xmin = xmin, xmax  =xmax, y_position =y_position, annotations = annot1, tip_length = 0.00)+
+  scale_fill_manual(values = c('#bdbdbd','#3182bd',"#e6550d")) + # fillの色を手動で指定
+  # x軸（strain）の順番を指定する, ggtextを使用すると*で囲むと斜体になる、labelsを指定
+  scale_x_discrete(limits = c("wt", "ade12∆"), labels =c("wt", "*ade12∆*")) + 
+  ylab("% cells with Ade4-GFP foci") +
+  xlab("")+
+  ylim(0,100)+ 
+  theme( axis.title.y = element_text(size=14), axis.text.y = element_text(size=14,color = "black"),
+         # ggtextを使用する場合はelement_markdownで指定
+         axis.text.x = element_markdown(size = 14,colour = "black")  
+         #,legend.position = "none" #凡例を消す
+         ,panel.border = element_rect(fill = NA, linewidth = 0.5) # パネルを枠で囲む
+         ,panel.background = element_blank()) #背景を白にする
+plot1
+```
+
