@@ -1,5 +1,6 @@
 # data_analysis_by_r_examples
 Rによるデータ解析の実例集  
+[プレプリント](https://www.biorxiv.org/content/10.1101/2023.06.05.543815v5)で使用した解析
 
 [Ade4顆粒脱会合の経時観察](https://htmlpreview.github.io/?https://github.com/masaktakaine/data_analysis_by_r_examples/blob/main/230306_ade4_granule_disassembly.html)  
 [蛍光タンパク質によるAde4凝集体の様相の違い（Kruskal-Wallis+Steel-Dwass）](https://htmlpreview.github.io/?https://github.com/masaktakaine/data_analysis_by_r_examples/blob/main/200212_Ade4FPtag_analysis/analysis_200214data.html)  
